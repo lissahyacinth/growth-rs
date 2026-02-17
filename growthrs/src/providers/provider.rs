@@ -1,4 +1,5 @@
-use crate::offering::{Offering, Region};
+use crate::offering::Offering;
+use crate::providers::kwok::KwokProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
@@ -32,13 +33,26 @@ pub enum ProviderError {
     Internal(#[from] anyhow::Error),
 }
 
-// Provide Nodes from a given Provider - i.e. GCP, Hetzner, KWOK
-// The provider's responsibility is to join a node to the cluster, or for the joining to fail loudly.
-pub(crate) trait Provider {
-    async fn offerings(&self, region: &Region) -> Vec<Offering>;
-    async fn create(
+/// Provide Nodes from a given Provider - i.e. GCP, Hetzner, KWOK
+/// The provider's responsibility is to join a node to the cluster, or for the joining to fail loudly.
+pub(crate) enum Provider {
+    Kwok(KwokProvider),
+}
+
+impl Provider {
+    pub async fn offerings(&self) -> Vec<Offering> {
+        match self {
+            Self::Kwok(p) => p.offerings().await,
+        }
+    }
+
+    pub async fn create(
         &self,
         offering: &Offering,
         config: &InstanceConfig,
-    ) -> Result<NodeId, ProviderError>;
+    ) -> Result<NodeId, ProviderError> {
+        match self {
+            Self::Kwok(p) => p.create(offering, config).await,
+        }
+    }
 }

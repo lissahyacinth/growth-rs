@@ -1,1 +1,3 @@
 # GrowthRS - Autoscaler
+
+Requires Cmake.
