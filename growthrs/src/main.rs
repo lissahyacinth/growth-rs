@@ -1,16 +1,8 @@
-use std::thread::sleep;
-use std::time::Duration;
-
 use kube::Client;
 
-use crate::controller::{controller_loop, create_test_pod, delete_test_pod};
-use crate::providers::kwok::KwokProvider;
-use crate::providers::provider::{InstanceConfig, Provider};
-
-mod controller;
-mod offering;
-mod optimiser;
-mod providers;
+use growthrs::controller::{self, ControllerContext};
+use growthrs::providers::kwok::KwokProvider;
+use growthrs::providers::provider::Provider;
 
 #[tokio::main]
 async fn main() {
@@ -22,20 +14,13 @@ async fn main() {
         .init();
 
     let client = Client::try_default().await.unwrap();
+    // TODO: Automatically select Provider from configuration.
     let provider = Provider::Kwok(KwokProvider::new(client.clone()));
-    //let offerings = provider.offerings().await.into_iter().filter(|offering| offering.resources.cpu >= 48 && offering.resources.memory_mib >= 65536).next();
-    //provider.create(&offerings.unwrap(), &InstanceConfig {}).await.unwrap();
-    // Delete - throwing away errors
-    delete_test_pod(client.clone(), "gpu-test")
-        .await
-        .unwrap_or(());
-    // Test pod is rather large,
-    create_test_pod(client.clone(), "gpu-test", "48", "64Gi", None)
-        .await
-        .unwrap();
-    sleep(Duration::from_secs(5));
-    controller_loop(client.clone(), &provider).await.unwrap();
-    delete_test_pod(client.clone(), "gpu-test")
-        .await
-        .unwrap_or(());
+
+    let ctx = ControllerContext { client, provider };
+
+    // The controller watches for Pending Pod events and reconciles automatically.
+    // To trigger manually, create an unschedulable pod — the watcher will pick it up.
+    // For a one-shot reconcile without the watcher, use controller::controller_loop_single().
+    controller::run(ctx).await;
 }

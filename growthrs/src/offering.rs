@@ -12,7 +12,7 @@ pub struct QuantityParseError {
 }
 
 /// (Instance) Offering
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Offering {
     pub instance_type: InstanceType,
     pub resources: Resources,
@@ -42,10 +42,39 @@ pub struct Zone(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceType(pub String);
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PodResources {
+impl InstanceType {
+    pub(crate) fn to_string(&self) -> String {
+        self.0.clone()
+    }
+}
+
+/// Unique identity of a pod (namespace + name).
+/// Prevents accidental swaps between the two string fields
+/// and provides a consistent `Display` format for logging and map keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PodId {
     pub namespace: String,
     pub name: String,
+}
+
+impl PodId {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PodId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.namespace, self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PodResources {
+    pub id: PodId,
     pub resources: Resources,
 }
 
@@ -69,7 +98,7 @@ pub struct Resources {
 }
 
 impl Offering {
-    pub(crate) fn satisfies(&self, need: &Resources) -> bool {
+    pub fn satisfies(&self, need: &Resources) -> bool {
         // TODO: Account for available memory vs provided memory
         self.resources.cpu >= need.cpu
             && self.resources.memory_mib >= need.memory_mib
@@ -163,10 +192,12 @@ fn parse_storage_gib(q: &Quantity) -> Result<u32, QuantityParseError> {
 impl PodResources {
     /// Build a `PodResources` from a Kubernetes Pod, extracting name/namespace
     /// and summing resource requests across all containers.
-    pub(crate) fn from_pod(pod: &Pod) -> Result<PodResources, QuantityParseError> {
+    pub fn from_pod(pod: &Pod) -> Result<PodResources, QuantityParseError> {
         Ok(PodResources {
-            namespace: pod.metadata.namespace.clone().unwrap_or_default(),
-            name: pod.metadata.name.clone().unwrap_or_default(),
+            id: PodId {
+                namespace: pod.metadata.namespace.clone().unwrap_or_default(),
+                name: pod.metadata.name.clone().unwrap_or_default(),
+            },
             resources: Resources::from_pod(pod)?,
         })
     }
@@ -174,7 +205,9 @@ impl PodResources {
 
 impl Resources {
     /// Extract total resource requests from a Pod by summing across all containers.
-    pub(crate) fn from_pod(pod: &Pod) -> Result<Resources, QuantityParseError> {
+    // TODO: Account for init containers. Kubernetes effective request is
+    // max(max(each init container), sum(regular containers)) per resource dimension.
+    pub fn from_pod(pod: &Pod) -> Result<Resources, QuantityParseError> {
         let mut cpu = 0u32;
         let mut memory_mib = 0u32;
         let mut gpu = 0u32;

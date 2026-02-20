@@ -18,30 +18,53 @@ Initial provider and machine availability will be;
 As Hetzner is very quick and cheap for machines. A separate RFC is being written for the Provider interface, as no existing Provider for Hetzner in Rust exists that can spin up new nodes on demand. KWOK (Kubernetes With Out Kubelet) will also be used for testing.
 
 ### Flexible Node Groups with Pool
+We define two example pools - one default with a range of CPU capacity, and one GPU pool.
+
 ```yaml
 apiVersion: growth/v1alpha1
-kind: NodeGroupWithPriority
+kind: NodePool
+metadata:
+  name: default
 spec:
-  pools:
-    - provider: hetzner
-      serverType: [CAX11]
-      priority: 90
-    - provider: hetzner
-      serverType: [CX31, CX32]
-      priority: 50
+  serverTypes:
+    - name: CAX11
+      max: 10
+    - name: CAX21
+      # MAYBE feature - pre-warm to guarantee 1 even without load
+      min: 1
+      max: 5
+    - name: CAX31
+      max: 1
+
+---
+
+apiVersion: growth/v1alpha1
+kind: NodePool
+metadata:
+  name: gpu
+spec:
+  serverTypes:
+    - name: GEX44
+      max: 5
 ```
 
-Which effectively says to prefer CAX11 if available, then use CX31 as backup. No knowledge exists for whether this node is the most appropriate. CX31 and CX32 being in the same array would be the same as writing 
-
+Pods can *opt* into a NodeGroup. 
 ```yaml
-...
-    - provider: hetzner
-      serverType: [CX31]
-      priority: 50
-    - provider: hetzner
-      serverType: [CX32]
-      priority: 50
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  nodeSelector:
+    growth.dev/pool: default
+  containers:
+  - name: nginx
+    image: nginx:1.14.2
+    ports:
+    - containerPort: 80
 ```
+
+If a `NodePool` with the name `default` exists, Pods are considered `opt-in` by default. Otherwise, pods have to explicitly `opt-in` by providing a nodeSelector that targets an existing `NodePool`.
 
 ### Autoscaler Loop
 
@@ -49,43 +72,78 @@ Which effectively says to prefer CAX11 if available, then use CX31 as backup. No
 apiVersion: growth/v1alpha1
 kind: NodeRequest
 metadata:
-  ownerReferences: [NodeGroupWithPriority]
+  # NodeRequests cannot exist without a NodePool, as otherwise we can't know what we're managing.
+  name: default-pool-{uuid}
+  ownerReferences: [NodePool]
 spec:
-  requirements:
-    cpu: "4"
-    memory: "8Gi"
+  targetOffering: hetzner-cax11
 status:
   phase: Provisioning  # Pending -> Provisioning -> Ready / Unmet
-  currentPool: gcp-g2-standard-8
-  attempts:
-    - pool: hetzner-gex44
-      result: InsufficientCapacity
-      timestamp: ...
-    - pool: gcp-g2-standard-8
-      result: Provisioning
-      timestamp: ...
-    - pool: gcp-g2-standard-16
-      result: Pending
-      timestamp: ...
+  events:
+    - at: 2026-01-01 21:07:52:00Z
+      name: nodeRequested
+    - at: 2026-01-01 21:08:00:00Z
+      name: nodeRequestFailed
+      reason: "No capacity"
+    - at: 2026-01-01 21:10:00:00Z
+      name: nodeProvisioned
+    - at: 2026-01-01 21:11:00:00Z
+      name: nodeLabelled
 ```
 
-1. Find Unschedulable Pods.
-2. Match the pods to `NodeGroupWithPriority`.
-  1. If multiple match, log error in operator. 
-3. Match pods to existing `NodeRequest`s in state `Pending`/`Provisioning`. (Assume `Ready` won't match against current Pod Demand, and `Provisioning` can't accept pods yet.)
-  1. Match is performed on Resource Requirements only, with other constraints left to future.
-  2. Sum resource demand from matched pods.
-  3. Sum expected capacity from existing `Pending`/`Provisioning` `NodeRequest`s.
-4. If demand exceeds planned capacity, create `NodeRequest`s to cover the shortfall.
-5. For each `NodeRequest` in state `Pending`.
-  1. Attempt the current pool, updating the timestamp.
+```yaml
+apiVersion: growth/v1alpha1
+kind: NodeRemovalRequest
+metadata:
+  name: default-pool-{uuid}
+status:
+  phase: CouldNotRemove  # Pending -> Deprovisioning, CouldNotRemove
+  events:
+    - at: 2026-01-01 21:07:52:00Z
+      name: Deletion requested
+    - at: 2026-01-01 21:08:00:00Z
+      name: Deletion failed
+      reason: "Insufficient permission..."
+```
+
+
+--- Handle New Demand
+1. Find Unschedulable Pods, label as `Demand`s.
+2. Match the pods to `NodePool`. The `NodePool` offers various machines, termed `Offering`s. 
+  1. Match pod to `NodePool` if the pod asks for a specific `NodePool`. 
+  2. If pod doesn't request a `NodePool`, and a `default` `NodePool` exists, use that.
+  3. If pod doesn't request a `NodePool`, and no `default` exists, create error event.
+  4. If pod requests a `NodePool`, and it doesn't exist, create error event. 
+3. Retrieve `NodeRequest`s in state `Pending`/`Provisioning`. (Assume `Ready` won't match against current Pod Demand, and `Provisioning` can't accept pods yet.)
+4. Retrieve `NodeRequest`s in state `Unmet` - these act as ways to tell the solver we don't believe these nodes are currently available, and should plan around them.
+5. Provide the Solver with `Demand`s, `Offering`s, and existing `NodeRequests` smuggled as `Offering`s. 
+6. The Solver provides a PlacementSolution. 
+  1. If the PlacementSolution is `AllPlaced`, create a `NodeRequest` for each potential node.
+  2. If the PlacementSolution is `NoDemands`, do nothing.
+  3. If the PlacementSolution is `IncompletePlacement`, create `NodeRequest`s where possible, but also emit events indicating what could not be scheduled and why.
+  4. Track consecutive `IncompletePlacement` results per unschedulable pod. If a pod has been unplaceable for N consecutive loops, apply exponential backoff to how often it is included in demand. After reaching a backoff ceiling, mark the pod as `BackOff` — exclude it from demand calculations and emit a `BackOff` event on the pod. This prevents the controller from spinning against an exhausted pool. `BackOff` pods are re-evaluated when an offering recovers from `Unmet` (i.e. its TTL expires and a subsequent provision succeeds).
+
+--- Separately, let's handle existing NodeRequests
+Currently we face an issue here - PlacementSolutions don't offer backups if a node isn't available. We could replan in this case, but it could cause a LOT of replanning for other nodes. 
+
+We can't easily track this in state. Fallbacks require replanning with the solver, and tracking pod -> node relationships. What's 'simpler' is removing a NodeType from the pool for N time, and all replans do not include that node. We can achieve that with the Unmet.
+
+1. For each `NodeRequest` in state `Pending`.
+  1. Request the node to be created from the provider.
   2. If provider accepts request, update state to `Provisioning` and add a prospective NodeID.
-  3. If all pools are `Unmet`, update `NodeRequest` to `Unmet`.
-6. For each `NodeRequest` in state `Provisioning`
-  1. Check prospective Node state. If Node becomes `Ready`, update `NodeRequest` to `Ready` and add labels matching the `NodeGroupWithPriority` that created it. 
-  2. After a known `ReadinessWait`, if Node does not become `Ready`, update attempts and attempt to remove Node. (This might be a provider detail for them to deal with.)
-  3. If attempts exceeds maxAttempts, updated to failed, reset `NodeRequest` to `Pending `,
-7. For each `NodeRequest` in state `Ready`/`Unmet`.
-  1. If now - timestamp exceeds TTL, delete.
-8. For each `Node` with a `NodeGroupWithPriority` label that has no pods (Ignoring DaemonSets etc.), mark the node as `ScaleDownAt: {FutureTime}` and taint it.
-9. For each `Node` with a `NodeGroupWithPriority` label where the current time has passed the `ScaleDownTime`, remove it.
+  3. If provider doesn't have capacity, update the state to `Unmet` with a known TTL. Pods linked to this demand will get new nodes provisioned on the next loop.
+2. For each `NodeRequest` in state `Provisioning`
+  1. Check prospective Node state. If Node becomes `Ready`, update `NodeRequest` to `Ready`
+  2. If, after a known `ReadinessWait`, the Node does not become `Ready`, update state to `Deprovisioning`.
+3. For each `NodeRequest` in state `Ready`/`Unmet`, if now - timestamp exceeds TTL, delete. (TTL for `Unmet` differs to TTL for `Ready`.)
+4. For each `NodeRequest` in state `Deprovisioning`, Create a `NodeRemovalRequest`, and remove the `NodeRequest`.
+
+--- Now, let's handle Node Removal and ScaleDown.
+1. For each `Node` with a `NodePool` label that has no pods (Ignoring DaemonSets etc.), mark the node as `ScaleDownAt: {FutureTime}` and apply a `NoSchedule` taint (`growth.dev/scale-down: NoSchedule`). The taint **must** be `NoSchedule` to prevent the Kubernetes scheduler from placing new pods onto a node that is about to be removed.
+2. For each `Node` with a `NodePool` label where the current time has passed the `ScaleDownTime`, verify the node still has no running pods (excluding DaemonSets), then create a `NodeRemovalRequest` object with state `Pending`. If pods have been scheduled since the taint was applied (e.g. via tolerations), remove the taint and cancel the scale-down.
+3. For each `NodeRemovalRequest` with state `Pending`, request deletion from the Provider and update the state to `Deprovisioning`. 
+4. For each `NodeRemovalRequest` with state `Deprovisioning`
+  1. Check state of Node on Provider, if deleted, verify the node has no running pods before finalising removal. If pods are present (e.g. via tolerations), cancel the removal, remove the `NoSchedule` taint, and delete the `NodeRemovalRequest`. Otherwise, remove the `NodeRemovalRequest` and free the node.
+  2. Request deletion from the provider, edit `NodeRemovalRequest` to increment `removalAttempt` and set `removeAttemptedAt` to now. 
+  3. If now - `removeAttemptedAt` exceeds a TTL, re-attempt deletion. 
+  4. If `removalAttempt` exceeds a total count, update state to `RemovalFailed`. Emit an event on the `NodeRemovalRequest` and the associated `Node` so that monitoring can alert on stuck nodes. `RemovalFailed` is a terminal state — the node remains tainted and the operator must investigate manually. A periodic retry (with long backoff, e.g. hours) may be added in future to handle transient provider issues.

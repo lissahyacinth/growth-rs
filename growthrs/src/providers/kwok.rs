@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{Node, NodeStatus};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::api::{ObjectMeta, PostParams};
+use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::{Api, Client};
 
 use crate::offering::{GpuModel, InstanceType, Offering, Region, Resources};
@@ -59,18 +59,18 @@ fn to_capacity(res: &Resources) -> BTreeMap<String, Quantity> {
 }
 
 /// Kubernetes With Out Kubelet Provider
-pub(crate) struct KwokProvider {
+pub struct KwokProvider {
     client: Client,
 }
 
 impl KwokProvider {
-    pub(crate) fn new(client: Client) -> Self {
+    pub fn new(client: Client) -> Self {
         Self { client }
     }
 }
 
 impl KwokProvider {
-    pub(crate) async fn offerings(&self) -> Vec<Offering> {
+    pub async fn offerings(&self) -> Vec<Offering> {
         vec![
             // CX – Shared x86                              $/hr
             offering("cx22", 2, 4_096, 40, 0.0066),
@@ -116,7 +116,7 @@ impl KwokProvider {
             ),
         ]
     }
-    pub(crate) async fn create(
+    pub async fn create(
         &self,
         offering: &Offering,
         _config: &InstanceConfig,
@@ -154,5 +154,16 @@ impl KwokProvider {
             })?;
         let name = created.metadata.name.unwrap();
         Ok(NodeId(name))
+    }
+
+    pub async fn delete(&self, node_id: &NodeId) -> Result<(), ProviderError> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        nodes
+            .delete(&node_id.0, &DeleteParams::default())
+            .await
+            .map_err(|e| ProviderError::CreationFailed {
+                message: e.to_string(),
+            })?;
+        Ok(())
     }
 }

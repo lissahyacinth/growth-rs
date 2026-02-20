@@ -1,4 +1,5 @@
 use crate::offering::Offering;
+use crate::providers::fake::FakeProvider;
 use crate::providers::kwok::KwokProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,17 +36,20 @@ pub enum ProviderError {
 
 /// Provide Nodes from a given Provider - i.e. GCP, Hetzner, KWOK
 /// The provider's responsibility is to join a node to the cluster, or for the joining to fail loudly.
-pub(crate) enum Provider {
+pub enum Provider {
     Kwok(KwokProvider),
+    Fake(FakeProvider),
 }
 
 impl Provider {
     pub async fn offerings(&self) -> Vec<Offering> {
         match self {
             Self::Kwok(p) => p.offerings().await,
+            Self::Fake(p) => p.offerings().await,
         }
     }
 
+    /// Asynchronously request a node be created
     pub async fn create(
         &self,
         offering: &Offering,
@@ -53,6 +57,15 @@ impl Provider {
     ) -> Result<NodeId, ProviderError> {
         match self {
             Self::Kwok(p) => p.create(offering, config).await,
+            Self::Fake(p) => p.create(offering, config).await,
+        }
+    }
+
+    /// Delete a node by its ID
+    pub async fn delete(&self, node_id: &NodeId) -> Result<(), ProviderError> {
+        match self {
+            Self::Kwok(p) => p.delete(node_id).await,
+            Self::Fake(p) => p.delete(node_id).await,
         }
     }
 }
