@@ -13,6 +13,7 @@ pub fn pending_pod(name: &str, cpu: &str, memory: &str) -> Pod {
         metadata: ObjectMeta {
             name: Some(name.into()),
             namespace: Some("default".into()),
+            uid: Some(format!("uid-{name}")),
             ..Default::default()
         },
         spec: Some(PodSpec {

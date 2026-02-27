@@ -1,10 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::offering::Offering;
-use crate::providers::provider::{InstanceConfig, NodeId, ProviderError};
+use crate::providers::provider::{InstanceConfig, NodeId, ProviderError, ProviderStatus};
 
 /// What happens on the next `create()` call.
 #[derive(Debug, Clone)]
@@ -36,6 +35,15 @@ pub enum DeleteBehavior {
     Fail(String),
 }
 
+/// What happens on the next `status()` call.
+#[derive(Debug, Clone)]
+pub enum StatusBehavior {
+    /// Returns the given ProviderStatus.
+    Return(ProviderStatus),
+    /// Network/API blowup.
+    InternalError(String),
+}
+
 /// How `offerings()` behaves.
 #[derive(Debug, Clone)]
 pub enum OfferingsBehavior {
@@ -58,16 +66,25 @@ pub struct DeleteCall {
     pub node_id: NodeId,
 }
 
+/// Logged record of a `status()` call.
+#[derive(Debug, Clone)]
+pub struct StatusCall {
+    pub node_id: NodeId,
+}
+
 /// Interior state behind the Arc<Mutex<_>>.
 #[derive(Debug)]
 pub(crate) struct FakeProviderState {
     offerings_behavior: OfferingsBehavior,
     create_behaviors: VecDeque<CreateBehavior>,
     delete_behaviors: VecDeque<DeleteBehavior>,
+    status_behaviors: VecDeque<StatusBehavior>,
     default_create: CreateBehavior,
     default_delete: DeleteBehavior,
+    default_status: StatusBehavior,
     pub create_calls: Vec<CreateCall>,
     pub delete_calls: Vec<DeleteCall>,
+    pub status_calls: Vec<StatusCall>,
 }
 
 /// A deterministic, in-memory provider for testing failure modes.
@@ -77,7 +94,6 @@ pub(crate) struct FakeProviderState {
 #[derive(Debug, Clone)]
 pub struct FakeProvider {
     state: Arc<Mutex<FakeProviderState>>,
-    next_id: Arc<AtomicU64>,
 }
 
 impl FakeProvider {
@@ -87,12 +103,14 @@ impl FakeProvider {
                 offerings_behavior: OfferingsBehavior::Static(vec![]),
                 create_behaviors: VecDeque::new(),
                 delete_behaviors: VecDeque::new(),
+                status_behaviors: VecDeque::new(),
                 default_create: CreateBehavior::Succeed,
                 default_delete: DeleteBehavior::Succeed,
+                default_status: StatusBehavior::Return(ProviderStatus::Running),
                 create_calls: Vec::new(),
                 delete_calls: Vec::new(),
+                status_calls: Vec::new(),
             })),
-            next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -137,6 +155,20 @@ impl FakeProvider {
         self
     }
 
+    pub fn on_next_status(self, behavior: StatusBehavior) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .status_behaviors
+            .push_back(behavior);
+        self
+    }
+
+    pub fn with_default_status(self, behavior: StatusBehavior) -> Self {
+        self.state.lock().unwrap().default_status = behavior;
+        self
+    }
+
     // ── Introspection ────────────────────────────────────────────────
 
     pub fn create_calls(&self) -> Vec<CreateCall> {
@@ -147,12 +179,11 @@ impl FakeProvider {
         self.state.lock().unwrap().delete_calls.clone()
     }
 
-    // ── Provider implementation ──────────────────────────────────────
-
-    fn next_node_id(&self) -> NodeId {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        NodeId(format!("fake-node-{n}"))
+    pub fn status_calls(&self) -> Vec<StatusCall> {
+        self.state.lock().unwrap().status_calls.clone()
     }
+
+    // ── Provider implementation ──────────────────────────────────────
 
     pub async fn offerings(&self) -> Vec<Offering> {
         let mut state = self.state.lock().unwrap();
@@ -171,6 +202,7 @@ impl FakeProvider {
 
     pub async fn create(
         &self,
+        node_id: String,
         offering: &Offering,
         _config: &InstanceConfig,
     ) -> Result<NodeId, ProviderError> {
@@ -182,16 +214,16 @@ impl FakeProvider {
                 .unwrap_or_else(|| state.default_create.clone())
         };
 
+        let node_id = NodeId(node_id);
+
         let result = match behavior {
-            CreateBehavior::Succeed | CreateBehavior::SucceedButNodeNeverJoins => {
-                Ok(self.next_node_id())
-            }
+            CreateBehavior::Succeed | CreateBehavior::SucceedButNodeNeverJoins => Ok(node_id),
             CreateBehavior::SucceedAfterDelay(d) => {
                 tokio::time::sleep(d).await;
-                Ok(self.next_node_id())
+                Ok(node_id)
             }
             CreateBehavior::OfferingUnavailable => Err(ProviderError::OfferingUnavailable(
-                format!("{} not available", offering.instance_type.0),
+                format!("{} not available", offering.instance_type),
             )),
             CreateBehavior::CreationFailed(msg) => {
                 Err(ProviderError::CreationFailed { message: msg })
@@ -230,6 +262,27 @@ impl FakeProvider {
             DeleteBehavior::Fail(msg) => Err(ProviderError::CreationFailed { message: msg }),
         }
     }
+
+    pub async fn status(&self, node_id: &NodeId) -> Result<ProviderStatus, ProviderError> {
+        let behavior = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .status_behaviors
+                .pop_front()
+                .unwrap_or_else(|| state.default_status.clone())
+        };
+
+        self.state.lock().unwrap().status_calls.push(StatusCall {
+            node_id: node_id.clone(),
+        });
+
+        match behavior {
+            StatusBehavior::Return(status) => Ok(status),
+            StatusBehavior::InternalError(msg) => {
+                Err(ProviderError::Internal(anyhow::anyhow!(msg)))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,9 +307,11 @@ mod tests {
     #[tokio::test]
     async fn default_create_succeeds() {
         let provider = FakeProvider::new().with_offerings(vec![test_offering()]);
-        let result = provider.create(&test_offering(), &InstanceConfig {}).await;
+        let result = provider
+            .create("my-node-1".into(), &test_offering(), &InstanceConfig::default())
+            .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().0, "fake-node-1");
+        assert_eq!(result.unwrap().0, "my-node-1");
     }
 
     #[tokio::test]
@@ -265,10 +320,14 @@ mod tests {
             .on_next_create(CreateBehavior::OfferingUnavailable)
             .on_next_create(CreateBehavior::Succeed);
 
-        let first = provider.create(&test_offering(), &InstanceConfig {}).await;
+        let first = provider
+            .create("node-1".into(), &test_offering(), &InstanceConfig::default())
+            .await;
         assert!(first.is_err());
 
-        let second = provider.create(&test_offering(), &InstanceConfig {}).await;
+        let second = provider
+            .create("node-2".into(), &test_offering(), &InstanceConfig::default())
+            .await;
         assert!(second.is_ok());
     }
 
@@ -278,10 +337,14 @@ mod tests {
             .with_default_create(CreateBehavior::JoinTimeout)
             .on_next_create(CreateBehavior::Succeed);
 
-        let first = provider.create(&test_offering(), &InstanceConfig {}).await;
+        let first = provider
+            .create("node-1".into(), &test_offering(), &InstanceConfig::default())
+            .await;
         assert!(first.is_ok());
 
-        let second = provider.create(&test_offering(), &InstanceConfig {}).await;
+        let second = provider
+            .create("node-2".into(), &test_offering(), &InstanceConfig::default())
+            .await;
         assert!(matches!(second, Err(ProviderError::JoinTimeout { .. })));
     }
 
@@ -290,11 +353,11 @@ mod tests {
         let provider = FakeProvider::new();
         let offering = test_offering();
         provider
-            .create(&offering, &InstanceConfig {})
+            .create("node-1".into(), &offering, &InstanceConfig::default())
             .await
             .unwrap();
         provider
-            .create(&offering, &InstanceConfig {})
+            .create("node-2".into(), &offering, &InstanceConfig::default())
             .await
             .unwrap();
 
@@ -305,24 +368,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_create_returns_distinct_node_id() {
+    async fn each_create_returns_the_provided_node_id() {
         let provider = FakeProvider::new();
         let offering = test_offering();
         let id1 = provider
-            .create(&offering, &InstanceConfig {})
+            .create("alpha".into(), &offering, &InstanceConfig::default())
             .await
             .unwrap();
         let id2 = provider
-            .create(&offering, &InstanceConfig {})
+            .create("beta".into(), &offering, &InstanceConfig::default())
             .await
             .unwrap();
         let id3 = provider
-            .create(&offering, &InstanceConfig {})
+            .create("gamma".into(), &offering, &InstanceConfig::default())
             .await
             .unwrap();
-        assert_ne!(id1, id2);
-        assert_ne!(id2, id3);
-        assert_ne!(id1, id3);
+        assert_eq!(id1.0, "alpha");
+        assert_eq!(id2.0, "beta");
+        assert_eq!(id3.0, "gamma");
     }
 
     #[tokio::test]
@@ -356,5 +419,47 @@ mod tests {
         // Sticks on last
         let third = provider.offerings().await;
         assert_eq!(third.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn status_default_returns_running() {
+        let provider = FakeProvider::new();
+        let result = provider.status(&NodeId("fake-node-1".into())).await;
+        assert_eq!(result.unwrap(), ProviderStatus::Running);
+        assert_eq!(provider.status_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_queued_behaviors_consumed_in_order() {
+        let provider = FakeProvider::new()
+            .on_next_status(StatusBehavior::Return(ProviderStatus::Creating))
+            .on_next_status(StatusBehavior::Return(ProviderStatus::Running));
+
+        let first = provider.status(&NodeId("n".into())).await.unwrap();
+        assert_eq!(first, ProviderStatus::Creating);
+
+        let second = provider.status(&NodeId("n".into())).await.unwrap();
+        assert_eq!(second, ProviderStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn status_falls_back_to_default() {
+        let provider = FakeProvider::new()
+            .with_default_status(StatusBehavior::Return(ProviderStatus::NotFound))
+            .on_next_status(StatusBehavior::Return(ProviderStatus::Creating));
+
+        let first = provider.status(&NodeId("n".into())).await.unwrap();
+        assert_eq!(first, ProviderStatus::Creating);
+
+        let second = provider.status(&NodeId("n".into())).await.unwrap();
+        assert_eq!(second, ProviderStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn status_internal_error() {
+        let provider =
+            FakeProvider::new().on_next_status(StatusBehavior::InternalError("boom".into()));
+        let result = provider.status(&NodeId("n".into())).await;
+        assert!(result.is_err());
     }
 }

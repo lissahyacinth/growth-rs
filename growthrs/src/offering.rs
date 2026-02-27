@@ -2,7 +2,16 @@ use std::num::ParseIntError;
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Label key used to match pods to NodePools via nodeSelector.
+pub const POOL_LABEL: &str = "growth.vettrdev.com/pool";
+pub const NODE_REQUEST_LABEL: &str = "growth.vettrdev.com/node-request";
+pub const INSTANCE_TYPE_LABEL: &str = "growth.vettrdev.com/instance-type";
+/// NVIDIA GPU Feature Discovery label for the GPU product/model.
+pub const GPU_PRODUCT_LABEL: &str = "nvidia.com/gpu.product";
 
 #[derive(Debug, Error)]
 #[error("failed to parse quantity \"{raw}\": {source}")]
@@ -42,9 +51,9 @@ pub struct Zone(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceType(pub String);
 
-impl InstanceType {
-    pub(crate) fn to_string(&self) -> String {
-        self.0.clone()
+impl std::fmt::Display for InstanceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -75,13 +84,27 @@ impl std::fmt::Display for PodId {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PodResources {
     pub id: PodId,
+    /// Kubernetes object UID, used to track which pods a NodeRequest claims.
+    pub uid: String,
     pub resources: Resources,
+    /// Pool name from the pod's `nodeSelector["growth.dev/pool"]`, if any.
+    pub pool: Option<String>,
+}
+
+/// Read the pool selector from a pod's nodeSelector.
+pub fn pod_pool_selector(pod: &Pod) -> Option<&str> {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+        .and_then(|sel| sel.get(POOL_LABEL))
+        .map(|s| s.as_str())
 }
 
 /// Resources available on an instance type.
 /// This is what lets you write `offerings.iter().filter(|o| o.resources.cpu >= 4)`
 /// instead of looking up "e2-medium" in a spreadsheet.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Resources {
     /// vCPU count.
     pub cpu: u32,
@@ -94,33 +117,39 @@ pub struct Resources {
     /// GPU count. 0 for non-GPU instances.
     pub gpu: u32,
     /// GPU model identifier when gpu > 0.
+    #[schemars(with = "Option<String>")]
     pub gpu_model: Option<GpuModel>,
+}
+
+impl Resources {
+    /// Can this resource capacity satisfy the given demand?
+    pub fn satisfies(&self, need: &Resources) -> bool {
+        // TODO: Account for available memory vs provided memory
+        let gpu_model_ok = need
+            .gpu_model
+            .as_ref()
+            .map_or(true, |needed| self.gpu_model.as_ref() == Some(needed));
+
+        let storage_ok = need
+            .ephemeral_storage_gib
+            .map_or(true, |req| self.ephemeral_storage_gib.is_some_and(|avail| avail >= req));
+
+        self.cpu >= need.cpu
+            && self.memory_mib >= need.memory_mib
+            && self.gpu >= need.gpu
+            && gpu_model_ok
+            && storage_ok
+    }
 }
 
 impl Offering {
     pub fn satisfies(&self, need: &Resources) -> bool {
-        // TODO: Account for available memory vs provided memory
-        self.resources.cpu >= need.cpu
-            && self.resources.memory_mib >= need.memory_mib
-            && self.resources.gpu >= need.gpu
-            && match &need.gpu_model {
-                Some(needed_gpu_model) => match &self.resources.gpu_model {
-                    Some(provided_gpu_model) => needed_gpu_model == provided_gpu_model,
-                    None => false,
-                },
-                None => true,
-            }
-            && match need.ephemeral_storage_gib {
-                Some(required_storage) => match self.resources.ephemeral_storage_gib {
-                    Some(provided_storage) => provided_storage >= required_storage,
-                    None => false,
-                },
-                None => true,
-            }
+        self.resources.satisfies(need)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum GpuModel {
     NvidiaT4,
     NvidiaA100,
@@ -128,6 +157,32 @@ pub enum GpuModel {
     NvidiaH100,
     NvidiaA10G,
     Other(String),
+}
+
+impl From<GpuModel> for String {
+    fn from(m: GpuModel) -> String {
+        match m {
+            GpuModel::NvidiaT4 => "NvidiaT4".to_string(),
+            GpuModel::NvidiaA100 => "NvidiaA100".to_string(),
+            GpuModel::NvidiaL4 => "NvidiaL4".to_string(),
+            GpuModel::NvidiaH100 => "NvidiaH100".to_string(),
+            GpuModel::NvidiaA10G => "NvidiaA10G".to_string(),
+            GpuModel::Other(s) => s,
+        }
+    }
+}
+
+impl From<String> for GpuModel {
+    fn from(s: String) -> GpuModel {
+        match s.as_str() {
+            "NvidiaT4" => GpuModel::NvidiaT4,
+            "NvidiaA100" => GpuModel::NvidiaA100,
+            "NvidiaL4" => GpuModel::NvidiaL4,
+            "NvidiaH100" => GpuModel::NvidiaH100,
+            "NvidiaA10G" => GpuModel::NvidiaA10G,
+            _ => GpuModel::Other(s),
+        }
+    }
 }
 
 /// Parse a Kubernetes CPU quantity into whole vCPU count (rounds up).
@@ -198,7 +253,9 @@ impl PodResources {
                 namespace: pod.metadata.namespace.clone().unwrap_or_default(),
                 name: pod.metadata.name.clone().unwrap_or_default(),
             },
+            uid: pod.metadata.uid.clone().unwrap_or_default(),
             resources: Resources::from_pod(pod)?,
+            pool: pod_pool_selector(pod).map(|s| s.to_string()),
         })
     }
 }
@@ -245,13 +302,19 @@ impl Resources {
             }
         }
 
+        let gpu_model = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_selector.as_ref())
+            .and_then(|sel| sel.get(GPU_PRODUCT_LABEL))
+            .map(|s| GpuModel::from(s.clone()));
+
         Ok(Resources {
             cpu,
             memory_mib,
             ephemeral_storage_gib,
             gpu,
-            // TODO: Include specific GPU Models
-            gpu_model: None,
+            gpu_model,
         })
     }
 }
@@ -407,6 +470,40 @@ mod tests {
         assert_eq!(r.cpu, 4);
         assert_eq!(r.memory_mib, 8192);
         assert_eq!(r.gpu, 2);
+    }
+
+    #[test]
+    fn from_pod_with_gpu_model() {
+        let mut requests = BTreeMap::new();
+        requests.insert("cpu".to_string(), q("4"));
+        requests.insert("memory".to_string(), q("8Gi"));
+        requests.insert("nvidia.com/gpu".to_string(), q("1"));
+        let container = Container {
+            name: "gpu-worker".to_string(),
+            resources: Some(ResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut node_selector = BTreeMap::new();
+        node_selector.insert(
+            "nvidia.com/gpu.product".to_string(),
+            "NvidiaA100".to_string(),
+        );
+        let pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![container],
+                node_selector: Some(node_selector),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = Resources::from_pod(&pod).unwrap();
+        assert_eq!(r.cpu, 4);
+        assert_eq!(r.memory_mib, 8192);
+        assert_eq!(r.gpu, 1);
+        assert_eq!(r.gpu_model, Some(GpuModel::NvidiaA100));
     }
 
     #[test]

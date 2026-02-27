@@ -21,7 +21,7 @@ As Hetzner is very quick and cheap for machines. A separate RFC is being written
 We define two example pools - one default with a range of CPU capacity, and one GPU pool.
 
 ```yaml
-apiVersion: growth/v1alpha1
+apiVersion: growth.vettrdev.com/v1alpha1
 kind: NodePool
 metadata:
   name: default
@@ -38,7 +38,7 @@ spec:
 
 ---
 
-apiVersion: growth/v1alpha1
+apiVersion: growth.vettrdev.com/v1alpha1
 kind: NodePool
 metadata:
   name: gpu
@@ -56,7 +56,7 @@ metadata:
   name: nginx
 spec:
   nodeSelector:
-    growth.dev/pool: default
+    growth.vettrdev.com/pool: default
   containers:
   - name: nginx
     image: nginx:1.14.2
@@ -69,7 +69,7 @@ If a `NodePool` with the name `default` exists, Pods are considered `opt-in` by 
 ### Autoscaler Loop
 
 ```yaml
-apiVersion: growth/v1alpha1
+apiVersion: growth.vettrdev.com/v1alpha1
 kind: NodeRequest
 metadata:
   # NodeRequests cannot exist without a NodePool, as otherwise we can't know what we're managing.
@@ -79,25 +79,36 @@ spec:
   targetOffering: hetzner-cax11
 status:
   phase: Provisioning  # Pending -> Provisioning -> Ready / Unmet
-  events:
-    - at: 2026-01-01 21:07:52:00Z
-      name: nodeRequested
-    - at: 2026-01-01 21:08:00:00Z
-      name: nodeRequestFailed
-      reason: "No capacity"
-    - at: 2026-01-01 21:10:00:00Z
-      name: nodeProvisioned
-    - at: 2026-01-01 21:11:00:00Z
-      name: nodeLabelled
+  lastTransitionTime: 2026-01-01 21:07:52:00Z
 ```
 
+#### Event Examples
 ```yaml
-apiVersion: growth/v1alpha1
+events:
+- at: 2026-01-01 21:07:52:00Z
+  name: nodeRequested
+- at: 2026-01-01 21:08:00:00Z
+  name: nodeRequestFailed
+  reason: "No capacity"
+- at: 2026-01-01 21:10:00:00Z
+  name: nodeProvisioned
+- at: 2026-01-01 21:11:00:00Z
+  name: nodeLabelled
+```      
+
+
+```yaml
+apiVersion: growth.vettrdev.com/v1alpha1
 kind: NodeRemovalRequest
 metadata:
   name: default-pool-{uuid}
 status:
   phase: CouldNotRemove  # Pending -> Deprovisioning, CouldNotRemove
+  lastTransitionTime: 2026-01-01 21:07:52:00Z
+```
+
+#### Example Events
+```yaml
   events:
     - at: 2026-01-01 21:07:52:00Z
       name: Deletion requested
@@ -105,7 +116,6 @@ status:
       name: Deletion failed
       reason: "Insufficient permission..."
 ```
-
 
 --- Handle New Demand
 1. Find Unschedulable Pods, label as `Demand`s.

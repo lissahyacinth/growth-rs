@@ -1,6 +1,9 @@
 mod common;
 
-use growthrs::controller::{reconcile_pods, ClusterState};
+use std::collections::HashMap;
+
+use growthrs::controller::{ClusterState, PoolConfig, reconcile_pods};
+use growthrs::node_pool::ServerTypeConfig;
 use growthrs::offering::PodResources;
 
 use common::{pending_pod, test_offering};
@@ -18,15 +21,35 @@ fn forty_pods_two_offerings_all_placed() {
         .iter()
         .map(|p| PodResources::from_pod(p).unwrap())
         .collect();
+
+    let pool = PoolConfig {
+        name: "default".to_string(),
+        uid: "default-uid".to_string(),
+        server_types: vec![
+            ServerTypeConfig {
+                name: "small-2cpu".to_string(),
+                max: 20,
+                min: 0,
+            },
+            ServerTypeConfig {
+                name: "medium-4cpu".to_string(),
+                max: 20,
+                min: 0,
+            },
+        ],
+    };
+
     let state = ClusterState {
         demands,
         offerings: vec![small, medium],
+        occupied_counts: HashMap::new(),
+        pools: vec![pool],
     };
 
     let result = reconcile_pods(state);
     assert!(result.is_ok(), "solver failed: {:?}", result.unwrap_err());
 
-    let created = result.unwrap().len();
+    let created = result.unwrap().demands.len();
 
     // Should need at most 20 nodes (worst case: all small, 2 pods each).
     assert!(

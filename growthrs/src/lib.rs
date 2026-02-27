@@ -1,4 +1,5 @@
 pub mod controller;
+pub mod node_pool;
 pub mod node_request;
 pub mod offering;
 pub mod optimiser;

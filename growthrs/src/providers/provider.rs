@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::offering::Offering;
 use crate::providers::fake::FakeProvider;
 use crate::providers::kwok::KwokProvider;
@@ -6,7 +8,11 @@ use crate::providers::kwok::KwokProvider;
 pub struct NodeId(pub String);
 
 /// Configuration for an Instance
-pub struct InstanceConfig {}
+#[derive(Default)]
+pub struct InstanceConfig {
+    /// Extra labels to apply to the created node.
+    pub labels: BTreeMap<String, String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -34,6 +40,22 @@ pub enum ProviderError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Infrastructure-level status of a VM as reported by the provider.
+///
+/// This says nothing about whether a K8s Node has joined the cluster —
+/// that's exclusively the Node Watcher's domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStatus {
+    /// VM is still being built/booted.
+    Creating,
+    /// VM is running (says nothing about K8s).
+    Running,
+    /// VM definitively failed.
+    Failed { reason: String },
+    /// Provider has no record of this VM.
+    NotFound,
+}
+
 /// Provide Nodes from a given Provider - i.e. GCP, Hetzner, KWOK
 /// The provider's responsibility is to join a node to the cluster, or for the joining to fail loudly.
 pub enum Provider {
@@ -52,12 +74,13 @@ impl Provider {
     /// Asynchronously request a node be created
     pub async fn create(
         &self,
+        node_id: String,
         offering: &Offering,
         config: &InstanceConfig,
     ) -> Result<NodeId, ProviderError> {
         match self {
-            Self::Kwok(p) => p.create(offering, config).await,
-            Self::Fake(p) => p.create(offering, config).await,
+            Self::Kwok(p) => p.create(node_id, offering, config).await,
+            Self::Fake(p) => p.create(node_id, offering, config).await,
         }
     }
 
@@ -66,6 +89,14 @@ impl Provider {
         match self {
             Self::Kwok(p) => p.delete(node_id).await,
             Self::Fake(p) => p.delete(node_id).await,
+        }
+    }
+
+    /// Query the infrastructure-level status of a VM.
+    pub async fn status(&self, node_id: &NodeId) -> Result<ProviderStatus, ProviderError> {
+        match self {
+            Self::Kwok(p) => p.status(node_id).await,
+            Self::Fake(p) => p.status(node_id).await,
         }
     }
 }

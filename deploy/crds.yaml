@@ -1,0 +1,159 @@
+---
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: noderequests.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["targetOffering", "nodeID"]
+              properties:
+                nodeID:
+                  type: string
+                  maxLength: 63 # Fit under instance name limit for most providers
+                  pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+                targetOffering:
+                  type: string
+                resources:
+                  type: object
+                  required: ["cpu", "memoryMib", "gpu"]
+                  properties:
+                    cpu:
+                      type: integer
+                    memoryMib:
+                      type: integer
+                    ephemeralStorageGib:
+                      type: integer
+                    gpu:
+                      type: integer
+                    gpu_model:
+                      type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Provisioning
+                    - Ready
+                    - Unmet
+                  default: Pending
+                lastTransitionTime:
+                  type: string
+                  format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Offering
+          type: string
+          jsonPath: .spec.targetOffering
+  scope: Cluster
+  names:
+    plural: noderequests
+    singular: noderequest
+    kind: NodeRequest
+    shortNames:
+      - nr
+
+
+---
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodepools.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["serverTypes"]
+              properties:
+                serverTypes:
+                  type: array
+                  items:
+                    type: object
+                    required: ["name", "max"]
+                    properties:
+                      name:
+                        type: string
+                      min:
+                        type: integer
+                        default: 0
+                      max:
+                        type: integer
+            status:
+              type: object
+      subresources:
+        status: {}
+  scope: Cluster
+  names:
+    plural: nodepools
+    singular: nodepool
+    kind: NodePool
+    shortNames:
+      - np
+
+---
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: noderemovalrequests.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Deprovisioning
+                    - CouldNotRemove
+                  default: Pending
+                lastTransitionTime:
+                  type: string
+                  format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+  scope: Cluster
+  names:
+    plural: noderemovalrequests
+    singular: noderemovalrequest
+    kind: NodeRemovalRequest
+    shortNames:
+      - nrr

@@ -4,9 +4,10 @@ use k8s_openapi::api::core::v1::{Node, NodeStatus};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::{Api, Client};
+use tracing::{debug, info};
 
-use crate::offering::{GpuModel, InstanceType, Offering, Region, Resources};
-use crate::providers::provider::{InstanceConfig, NodeId, ProviderError};
+use crate::offering::{GpuModel, InstanceType, Offering, Resources};
+use crate::providers::provider::{InstanceConfig, NodeId, ProviderError, ProviderStatus};
 
 fn offering(name: &str, cpu: u32, memory_mib: u32, disk_gib: u32, cost_per_hour: f64) -> Offering {
     Offering {
@@ -118,21 +119,32 @@ impl KwokProvider {
     }
     pub async fn create(
         &self,
+        node_id: String,
         offering: &Offering,
-        _config: &InstanceConfig,
+        config: &InstanceConfig,
     ) -> Result<NodeId, ProviderError> {
+        info!(
+            node_id = %node_id,
+            instance_type = %offering.instance_type,
+            cpu = offering.resources.cpu,
+            memory_mib = offering.resources.memory_mib,
+            "creating KWOK node"
+        );
         let mut capacity = to_capacity(&offering.resources);
         capacity.insert("pods".into(), Quantity("110".into()));
         let allocatable = capacity.clone();
 
+        let mut labels = BTreeMap::from([
+            ("type".into(), "kwok".into()),
+            ("app.kubernetes.io/managed-by".into(), "growth".into()),
+        ]);
+        labels.extend(config.labels.clone());
+
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node = Node {
             metadata: ObjectMeta {
-                name: Some(format!("growth-kwok-{}", uuid::Uuid::new_v4())),
-                labels: Some(BTreeMap::from([
-                    ("type".into(), "kwok".into()),
-                    ("app.kubernetes.io/managed-by".into(), "growth".into()),
-                ])),
+                name: Some(node_id),
+                labels: Some(labels),
                 annotations: Some(BTreeMap::from([(
                     "kwok.x-k8s.io/node".into(),
                     "fake".into(),
@@ -153,10 +165,12 @@ impl KwokProvider {
                 message: e.to_string(),
             })?;
         let name = created.metadata.name.unwrap();
+        debug!(node_id = %name, "KWOK node created");
         Ok(NodeId(name))
     }
 
     pub async fn delete(&self, node_id: &NodeId) -> Result<(), ProviderError> {
+        info!(node_id = %node_id.0, "deleting KWOK node");
         let nodes: Api<Node> = Api::all(self.client.clone());
         nodes
             .delete(&node_id.0, &DeleteParams::default())
@@ -165,5 +179,17 @@ impl KwokProvider {
                 message: e.to_string(),
             })?;
         Ok(())
+    }
+
+    pub async fn status(&self, node_id: &NodeId) -> Result<ProviderStatus, ProviderError> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        match nodes
+            .get_opt(&node_id.0)
+            .await
+            .map_err(|e| ProviderError::Internal(e.into()))?
+        {
+            Some(_) => Ok(ProviderStatus::Running),
+            None => Ok(ProviderStatus::NotFound),
+        }
     }
 }
