@@ -148,10 +148,10 @@ We can't easily track this in state. Fallbacks require replanning with the solve
   3. If provider doesn't have capacity, update the state to `Unmet`. Pods linked to this demand will get new nodes provisioned on the next loop.
 2. For each `NodeRequest` in state `Provisioning`
   1. Check prospective Node status via the provider. If provider reports `Failed` or `NotFound`, update to `Unmet`.
-  2. If, after a known `provisioning_timeout`, the Node does not become `Ready`, call `provider.delete()` and update state to `Deprovisioning`. If the delete call fails, stay in `Provisioning` and requeue for retry.
+  2. If, after a known `provisioning_timeout`, the Node does not become `Ready`, create a `NodeRemovalRequest` in `Deprovisioning` phase for the orphan node (delegating cleanup to the NRR reconciler) and update the NR to `Unmet`. If NRR creation fails, stay in `Provisioning` and requeue for retry.
 3. For each `NodeRequest` in state `Ready`, await further changes. (Planned: TTL-based cleanup.)
 4. For each `NodeRequest` in state `Unmet`, await further changes. (Planned: TTL-based cleanup to release the slot.)
-5. For each `NodeRequest` in state `Deprovisioning`, poll the provider. Once the provider confirms the node is gone (`NotFound`), delete the NodeRequest CRD. Otherwise, requeue for retry. (Planned: stall detection and alerting.)
+5. `Deprovisioning` is a legacy phase. Any NR found in this state is deleted immediately. Node cleanup is now handled exclusively via `NodeRemovalRequest`.
 
 --- Now, let's handle Node Removal and ScaleDown.
 A periodic idle-node scanner runs alongside the per-object NRR reconciler.

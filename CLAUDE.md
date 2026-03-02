@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GrowthRS is a Kubernetes cluster autoscaler operator written in Rust. It allows users to declare priority-ordered node pools via CRDs and automatically provisions nodes to satisfy unschedulable pod demand. Providers include KWOK (for testing) and Hetzner (production).
+GrowthRS is a Kubernetes cluster autoscaler operator written in Rust. It allows users to declare node pools via CRDs and automatically provisions nodes to satisfy unschedulable pod demand. Providers include KWOK (for testing) and Hetzner (production).
 
 ## Build Commands
 
@@ -37,27 +37,32 @@ cargo check --manifest-path growthrs/Cargo.toml
 
 ### Provider Interface (`providers/provider.rs`)
 
-The `Provider` trait has two methods:
-- `offerings(region)` → what instance types are available
-- `create(offering, config)` → provision a node and return its `NodeId`
+The `Provider` enum dispatches to concrete implementations with four methods:
+- `offerings()` → what instance types are available
+- `create(node_id, offering, config)` → provision a node and return its `NodeId`
+- `delete(node_id)` → remove a node
+- `status(node_id)` → query infrastructure-level VM status
 
-Errors go through `ProviderError` (creation failure, join timeout, offering unavailable, missing config, or internal). Providers are responsible for the node joining the cluster or failing loudly.
+Errors go through `ProviderError` (creation failure, deletion failure, join timeout, offering unavailable, missing config, unknown provider, or internal). Providers are responsible for the node joining the cluster or failing loudly.
 
 Current implementations:
 - **KWOK** (`providers/kwok.rs`) — Creates fake Kubernetes nodes via the API. Offerings mirror Hetzner's current lineup (CX, CPX, CAX, CCX series) plus fictional GPU instances for testing.
-- **Hetzner** — Production provider, not yet implemented.
+- **Fake** (`providers/fake.rs`) — Deterministic in-memory provider for testing failure modes and chaos scenarios. Queued behaviors let tests script exact sequences of successes, failures, and delays.
+- **Hetzner** — Planned production provider, not yet implemented.
 
 ### CRDs
 
-Two Custom Resource Definitions drive the system:
+Four Custom Resource Definitions drive the system:
 
-- **NodeGroupWithPriority** (`growth/v1alpha1`) — Declares scaling pools with priority ordering. Higher priority pools are attempted first. Multiple server types at the same priority are interchangeable.
-- **NodeRequest** (`growth/v1alpha1`) — Tracks individual node provisioning requests through a state machine: `Pending → Provisioning → Ready | Unmet`.
+- **NodePool** (`growth.vettrdev.com/v1alpha1`) — Declares scaling pools with available server types and scaling limits. Pods opt into pools via a `nodeSelector` label.
+- **NodeRequest** (`growth.vettrdev.com/v1alpha1`) — Tracks individual node provisioning requests through a state machine: `Pending → Provisioning → Ready | Unmet | Deprovisioning`.
+- **NodeRemovalRequest** (`growth.vettrdev.com/v1alpha1`) — Tracks node scale-down through: `Pending → Deprovisioning | CouldNotRemove`. Implemented in `crds/node_removal_request.rs` (types) and `controller/node_removal/` (reconciler, idle-node detection, helpers).
+- **HetznerNodeClass** (`growth.vettrdev.com/v1alpha1`) — Provider-specific instance configuration for Hetzner. Declares OS image, SSH keys, and user-data template with variable substitution from Secrets. Defined in `crds/hetzner_node_class.rs`.
 
 ### Autoscaler Reconciliation Loop
 
 The operator runs a continuous loop:
-1. Find unschedulable pods and match them to `NodeGroupWithPriority` resources
+1. Find unschedulable pods and match them to `NodePool` resources
 2. Compare resource demand against existing `Pending`/`Provisioning` NodeRequests
 3. Create new NodeRequests for any shortfall
 4. Advance NodeRequests through the state machine by communicating with providers
