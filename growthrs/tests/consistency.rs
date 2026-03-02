@@ -1,9 +1,9 @@
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use growthrs::controller::{ClusterState, PoolConfig, reconcile_pods};
-use growthrs::node_pool::ServerTypeConfig;
+use growthrs::crds::node_pool::ServerTypeConfig;
 use growthrs::offering::PodResources;
 
 use common::{pending_pod, test_offering};
@@ -30,6 +30,8 @@ fn demands_include_claimed_pod_uids() {
             max: 100,
             min: 0,
         }],
+        labels: BTreeMap::new(),
+        locations: None,
     };
 
     let state = ClusterState {
@@ -74,6 +76,8 @@ fn second_reconcile_with_claimed_pods_filtered_creates_nothing() {
             max: 100,
             min: 0,
         }],
+        labels: BTreeMap::new(),
+        locations: None,
     };
 
     // First reconciliation — pods are unclaimed.
@@ -132,6 +136,8 @@ fn unmet_node_requests_release_claimed_pods() {
             max: 100,
             min: 0,
         }],
+        labels: BTreeMap::new(),
+        locations: None,
     };
 
     // First reconciliation — produces NRs claiming both pods.

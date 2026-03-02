@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use k8s_openapi::api::core::v1::Pod;
 use tracing::{debug, warn};
 
-use crate::node_pool::ServerTypeConfig;
+use crate::crds::node_pool::{LocationConstraint, ServerTypeConfig};
 use crate::offering::{Offering, PodId, PodResources};
 use crate::optimiser::{BoundedOffering, PlacementSolution, SolveError, SolveOptions, solve};
 
@@ -14,6 +14,8 @@ pub struct NodeRequestDemand {
     pub target_offering: Offering,
     /// UIDs of the pods this node is being provisioned for.
     pub claimed_pod_uids: Vec<String>,
+    /// Labels from the owning NodePool, to be applied to the provisioned node.
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Configuration for a single pool, derived from a NodePool CRD.
@@ -22,6 +24,10 @@ pub struct PoolConfig {
     pub name: String,
     pub uid: String,
     pub server_types: Vec<ServerTypeConfig>,
+    /// Labels from the NodePool spec, applied to every node in this pool.
+    pub labels: BTreeMap<String, String>,
+    /// If set, only offerings matching at least one entry are eligible.
+    pub locations: Option<Vec<LocationConstraint>>,
 }
 
 /// A pod that could not be assigned to any pool.
@@ -173,12 +179,49 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
         let suitable: Vec<_> = pool_offerings
             .iter()
             .filter(|o| pool_demands.iter().any(|d| o.satisfies(&d.resources)))
-            .map(|o| BoundedOffering {
-                max_instances: max_by_type
+            .filter(|o| {
+                // Filter by location constraints: offering must match at least one entry.
+                // No locations = all regions/zones allowed.
+                if let Some(locations) = &pool.locations {
+                    locations.iter().any(|loc| {
+                        if loc.region != o.location.region.0 {
+                            return false;
+                        }
+                        match (&loc.zones, &o.location.zone) {
+                            (Some(zones), Some(z)) => zones.iter().any(|a| a == &z.0),
+                            (Some(_), None) => false,
+                            (None, _) => true,
+                        }
+                    })
+                } else {
+                    true
+                }
+            })
+            .map(|o| {
+                let remaining_max = max_by_type
                     .get(o.instance_type.0.as_str())
                     .copied()
-                    .unwrap_or(0),
-                offering: o.clone(),
+                    .unwrap_or(0);
+
+                // Derive topology labels from offering location.
+                let mut labels = pool.labels.clone();
+                labels.insert(
+                    "topology.kubernetes.io/region".into(),
+                    o.location.region.0.clone(),
+                );
+                if let Some(ref z) = o.location.zone {
+                    labels.insert(
+                        "topology.kubernetes.io/zone".into(),
+                        z.0.clone(),
+                    );
+                }
+
+                BoundedOffering {
+                    max_instances: remaining_max,
+                    offering: o.clone(),
+                    labels,
+                    type_group: Some(format!("{}/{}", pool_name, o.instance_type.0)),
+                }
             })
             .collect();
 
@@ -218,6 +261,7 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
                     pool_uid: pool.uid.clone(),
                     target_offering: node.offering,
                     claimed_pod_uids,
+                    labels: pool.labels.clone(),
                 }
             })
             .collect();
@@ -234,6 +278,8 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
 
     use crate::offering::{InstanceType, PodId, Resources};
 
@@ -253,6 +299,8 @@ mod tests {
             uid: format!("uid-{name}"),
             resources: res(cpu, memory_mib),
             pool: None,
+            pod_labels: BTreeMap::new(),
+            affinity_constraints: vec![],
         }
     }
 
@@ -262,14 +310,21 @@ mod tests {
             uid: format!("uid-{name}"),
             resources: res(cpu, memory_mib),
             pool: Some(pool.to_string()),
+            pod_labels: BTreeMap::new(),
+            affinity_constraints: vec![],
         }
     }
 
     fn offering(name: &str, cpu: u32, memory_mib: u32, cost: f64) -> Offering {
+        use crate::offering::{Location, Region, Zone};
         Offering {
             instance_type: InstanceType(name.into()),
             resources: res(cpu, memory_mib),
             cost_per_hour: cost,
+            location: Location {
+                region: Region("eu-central".into()),
+                zone: Some(Zone("fsn1-dc14".into())),
+            },
         }
     }
 
@@ -285,6 +340,8 @@ mod tests {
                     min: 0,
                 })
                 .collect(),
+            labels: BTreeMap::new(),
+            locations: None,
         }
     }
 
@@ -341,11 +398,15 @@ mod tests {
                 name: "gpu".to_string(),
                 uid: "gpu-uid".to_string(),
                 server_types: vec![],
+                labels: BTreeMap::new(),
+                locations: None,
             },
             PoolConfig {
                 name: "cpu".to_string(),
                 uid: "cpu-uid".to_string(),
                 server_types: vec![],
+                labels: BTreeMap::new(),
+                locations: None,
             },
         ];
         let demands = vec![pod_with_pool("a", 1, 1024, "gpu")];
@@ -362,6 +423,8 @@ mod tests {
             name: "cpu".to_string(),
             uid: "cpu-uid".to_string(),
             server_types: vec![],
+            labels: BTreeMap::new(),
+            locations: None,
         }];
         let demands = vec![pod_with_pool("a", 1, 1024, "nonexistent")];
         let (assigned, errors) = assign_pods_to_pools(&demands, &pools);
@@ -377,6 +440,8 @@ mod tests {
             name: "default".to_string(),
             uid: "default-uid".to_string(),
             server_types: vec![],
+            labels: BTreeMap::new(),
+            locations: None,
         }];
         let demands = vec![pod("a", 1, 1024)];
         let (assigned, errors) = assign_pods_to_pools(&demands, &pools);
@@ -391,6 +456,8 @@ mod tests {
             name: "gpu-only".to_string(),
             uid: "gpu-uid".to_string(),
             server_types: vec![],
+            labels: BTreeMap::new(),
+            locations: None,
         }];
         let demands = vec![pod("a", 1, 1024)];
         let (_, errors) = assign_pods_to_pools(&demands, &pools);
@@ -411,6 +478,8 @@ mod tests {
                 max: 10,
                 min: 0,
             }],
+            labels: BTreeMap::new(),
+            locations: None,
         };
         let offerings = vec![
             offering("cx22", 2, 4096, 0.01),
@@ -433,6 +502,8 @@ mod tests {
                 max: 10,
                 min: 0,
             }],
+            labels: BTreeMap::new(),
+            locations: None,
         };
         let state = ClusterState {
             demands: vec![pod_with_pool("a", 1, 1024, "workers")],
@@ -457,6 +528,8 @@ mod tests {
                 max: 10,
                 min: 0,
             }],
+            labels: BTreeMap::new(),
+            locations: None,
         };
         let state = ClusterState {
             demands: vec![pod_with_pool("a", 1, 1024, "nonexistent")],
@@ -481,6 +554,8 @@ mod tests {
                 max: 2,
                 min: 0,
             }],
+            labels: BTreeMap::new(),
+            locations: None,
         };
         let state = ClusterState {
             demands: vec![pod("a", 2, 4096), pod("b", 2, 4096), pod("c", 2, 4096)],
@@ -493,6 +568,249 @@ mod tests {
         };
         let result = reconcile_pods(state).unwrap();
         // max=2, occupied=1 → solver may only provision 1 more node
+        assert_eq!(result.demands.len(), 1);
+    }
+
+    // --- Location constraint filtering tests ---
+
+    fn offering_in(
+        name: &str,
+        cpu: u32,
+        memory_mib: u32,
+        cost: f64,
+        region: &str,
+        zone: Option<&str>,
+    ) -> Offering {
+        use crate::offering::{Location, Region, Zone};
+        Offering {
+            instance_type: InstanceType(name.into()),
+            resources: res(cpu, memory_mib),
+            cost_per_hour: cost,
+            location: Location {
+                region: Region(region.into()),
+                zone: zone.map(|z| Zone(z.into())),
+            },
+        }
+    }
+
+    #[test]
+    fn location_region_only_filters_by_region() {
+        use crate::crds::node_pool::LocationConstraint;
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: Some(vec![LocationConstraint {
+                region: "us-west".to_string(),
+                zones: None,
+            }]),
+        };
+        let offerings = vec![
+            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("b")),
+            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
+        ];
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
+        assert_eq!(result.demands.len(), 1);
+        // The selected offering must be in us-west
+        assert!(result.demands[0]
+            .target_offering
+            .location
+            .region
+            .0
+            .starts_with("us-west"));
+    }
+
+    #[test]
+    fn location_region_plus_zones_filters_correctly() {
+        use crate::crds::node_pool::LocationConstraint;
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: Some(vec![LocationConstraint {
+                region: "us-west".to_string(),
+                zones: Some(vec!["a".to_string()]),
+            }]),
+        };
+        let offerings = vec![
+            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("b")),
+            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("a")),
+        ];
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
+        assert_eq!(result.demands.len(), 1);
+        let loc = &result.demands[0].target_offering.location;
+        assert_eq!(loc.region.0, "us-west");
+        assert_eq!(loc.zone.as_ref().unwrap().0, "a");
+    }
+
+    #[test]
+    fn multi_region_mixed_zone_constraints() {
+        use crate::crds::node_pool::LocationConstraint;
+        // us-west4: zones a,b; us-west2: zone a only
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: Some(vec![
+                LocationConstraint {
+                    region: "us-west4".to_string(),
+                    zones: Some(vec!["a".to_string(), "b".to_string()]),
+                },
+                LocationConstraint {
+                    region: "us-west2".to_string(),
+                    zones: Some(vec!["a".to_string()]),
+                },
+            ]),
+        };
+        let offerings = vec![
+            offering_in("cx22", 2, 4096, 0.01, "us-west4", Some("a")),
+            offering_in("cx22", 2, 4096, 0.01, "us-west4", Some("b")),
+            offering_in("cx22", 2, 4096, 0.01, "us-west2", Some("a")),
+            offering_in("cx22", 2, 4096, 0.01, "us-west2", Some("b")), // should be filtered
+            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("x")), // wrong region
+        ];
+        // 4 pods to force multiple nodes → proves multiple offerings pass
+        let state = ClusterState {
+            demands: vec![
+                pod("a", 2, 4096),
+                pod("b", 2, 4096),
+                pod("c", 2, 4096),
+            ],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
+        // All placed offerings must be in the allowed set
+        for d in &result.demands {
+            let loc = &d.target_offering.location;
+            let region = &loc.region.0;
+            let zone = loc.zone.as_ref().map(|z| z.0.as_str());
+            match region.as_str() {
+                "us-west4" => assert!(
+                    zone == Some("a") || zone == Some("b"),
+                    "unexpected zone {zone:?} in us-west4"
+                ),
+                "us-west2" => assert_eq!(zone, Some("a"), "only zone a in us-west2"),
+                other => panic!("unexpected region {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_locations_allows_all_offerings() {
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: None,
+        };
+        let offerings = vec![
+            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
+        ];
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
+        assert_eq!(result.demands.len(), 1);
+    }
+
+    #[test]
+    fn offering_without_zone_rejected_when_zones_specified() {
+        use crate::crds::node_pool::LocationConstraint;
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: Some(vec![LocationConstraint {
+                region: "us-west".to_string(),
+                zones: Some(vec!["a".to_string()]),
+            }]),
+        };
+        // Offering has no zone — should not pass a constraint that lists specific zones
+        let offerings = vec![offering_in("cx22", 2, 4096, 0.01, "us-west", None)];
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
+        assert!(
+            result.demands.is_empty(),
+            "zone-less offering should be rejected when zones are specified"
+        );
+    }
+
+    #[test]
+    fn offering_without_zone_accepted_when_zones_omitted() {
+        use crate::crds::node_pool::LocationConstraint;
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: Some(vec![LocationConstraint {
+                region: "us-west".to_string(),
+                zones: None,
+            }]),
+        };
+        // Offering has no zone — region-only constraint should accept it
+        let offerings = vec![offering_in("cx22", 2, 4096, 0.01, "us-west", None)];
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings,
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+        };
+        let result = reconcile_pods(state).unwrap();
         assert_eq!(result.demands.len(), 1);
     }
 }

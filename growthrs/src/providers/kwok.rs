@@ -6,10 +6,24 @@ use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::{Api, Client};
 use tracing::{debug, info};
 
-use crate::offering::{GpuModel, InstanceType, Offering, Resources};
+use crate::offering::{GpuModel, InstanceType, Location, Offering, Region, Resources, Zone};
 use crate::providers::provider::{InstanceConfig, NodeId, ProviderError, ProviderStatus};
 
-fn offering(name: &str, cpu: u32, memory_mib: u32, disk_gib: u32, cost_per_hour: f64) -> Offering {
+/// Hetzner-like zone names used by the KWOK provider for testing.
+const ZONES: &[(&str, &str)] = &[
+    ("eu-central", "fsn1-dc14"),
+    ("eu-central", "nbg1-dc3"),
+    ("eu-central", "hel1-dc2"),
+];
+
+fn offering(
+    name: &str,
+    cpu: u32,
+    memory_mib: u32,
+    disk_gib: u32,
+    cost_per_hour: f64,
+    location: Location,
+) -> Offering {
     Offering {
         instance_type: InstanceType(name.into()),
         resources: Resources {
@@ -20,6 +34,7 @@ fn offering(name: &str, cpu: u32, memory_mib: u32, disk_gib: u32, cost_per_hour:
             gpu_model: None,
         },
         cost_per_hour,
+        location,
     }
 }
 
@@ -31,6 +46,7 @@ fn gpu_offering(
     gpu: u32,
     gpu_model: GpuModel,
     cost_per_hour: f64,
+    location: Location,
 ) -> Offering {
     Offering {
         instance_type: InstanceType(name.into()),
@@ -42,10 +58,11 @@ fn gpu_offering(
             gpu_model: Some(gpu_model),
         },
         cost_per_hour,
+        location,
     }
 }
 
-fn to_capacity(res: &Resources) -> BTreeMap<String, Quantity> {
+pub(crate) fn to_capacity(res: &Resources) -> BTreeMap<String, Quantity> {
     let mut cap = BTreeMap::from([
         ("cpu".into(), Quantity(res.cpu.to_string())),
         ("memory".into(), Quantity(format!("{}Mi", res.memory_mib))),
@@ -72,50 +89,64 @@ impl KwokProvider {
 
 impl KwokProvider {
     pub async fn offerings(&self) -> Vec<Offering> {
-        vec![
-            // CX – Shared x86                              $/hr
-            offering("cx22", 2, 4_096, 40, 0.0066),
-            offering("cx32", 4, 8_192, 80, 0.0106),
-            offering("cx42", 8, 16_384, 160, 0.0170),
-            offering("cx52", 16, 32_768, 320, 0.0314),
+        /// (name, cpu, mem_mib, disk_gib, cost/hr)
+        const CPU_TYPES: &[(&str, u32, u32, u32, f64)] = &[
+            // CX – Shared x86
+            ("cx22", 2, 4_096, 40, 0.0066),
+            ("cx32", 4, 8_192, 80, 0.0106),
+            ("cx42", 8, 16_384, 160, 0.0170),
+            ("cx52", 16, 32_768, 320, 0.0314),
             // CPX – Shared AMD
-            offering("cpx12", 2, 2_048, 40, 0.0122),
-            offering("cpx22", 3, 4_096, 80, 0.0226),
-            offering("cpx32", 4, 8_192, 160, 0.0299),
-            offering("cpx42", 8, 16_384, 256, 0.0362),
-            offering("cpx52", 16, 32_768, 360, 0.0515),
+            ("cpx12", 2, 2_048, 40, 0.0122),
+            ("cpx22", 3, 4_096, 80, 0.0226),
+            ("cpx32", 4, 8_192, 160, 0.0299),
+            ("cpx42", 8, 16_384, 256, 0.0362),
+            ("cpx52", 16, 32_768, 360, 0.0515),
             // CAX – ARM (Ampere)
-            offering("cax11", 2, 4_096, 40, 0.0074),
-            offering("cax21", 4, 8_192, 80, 0.0122),
-            offering("cax31", 8, 16_384, 160, 0.0226),
-            offering("cax41", 16, 32_768, 320, 0.0443),
+            ("cax11", 2, 4_096, 40, 0.0074),
+            ("cax21", 4, 8_192, 80, 0.0122),
+            ("cax31", 8, 16_384, 160, 0.0226),
+            ("cax41", 16, 32_768, 320, 0.0443),
             // CCX – Dedicated x86
-            offering("ccx13", 2, 8_192, 80, 0.0386),
-            offering("ccx23", 4, 16_384, 160, 0.0475),
-            offering("ccx33", 8, 32_768, 240, 0.0900),
-            offering("ccx43", 16, 65_536, 360, 0.1789),
-            offering("ccx53", 32, 131_072, 600, 0.3568),
-            offering("ccx63", 48, 196_608, 960, 0.5347),
-            // GPU (fictional, for testing GPU scheduling)
-            gpu_offering(
-                "gpu-a100-1",
-                12,
-                131_072,
-                200,
-                1,
-                GpuModel::NvidiaA100,
-                2.21,
-            ),
-            gpu_offering(
-                "gpu-a100-4",
-                48,
-                524_288,
-                800,
-                4,
-                GpuModel::NvidiaA100,
-                8.84,
-            ),
-        ]
+            ("ccx13", 2, 8_192, 80, 0.0386),
+            ("ccx23", 4, 16_384, 160, 0.0475),
+            ("ccx33", 8, 32_768, 240, 0.0900),
+            ("ccx43", 16, 65_536, 360, 0.1789),
+            ("ccx53", 32, 131_072, 600, 0.3568),
+            ("ccx63", 48, 196_608, 960, 0.5347),
+        ];
+
+        /// (name, cpu, mem_mib, disk_gib, gpu, model, cost/hr)
+        const GPU_TYPES: &[(&str, u32, u32, u32, u32, f64)] = &[
+            ("gpu-a100-1", 12, 131_072, 200, 1, 2.21),
+            ("gpu-a100-4", 48, 524_288, 800, 4, 8.84),
+        ];
+
+        let mut offerings = Vec::new();
+
+        for &(region, zone) in ZONES {
+            let loc = Location {
+                region: Region(region.into()),
+                zone: Some(Zone(zone.into())),
+            };
+            for &(name, cpu, mem, disk, cost) in CPU_TYPES {
+                offerings.push(offering(name, cpu, mem, disk, cost, loc.clone()));
+            }
+            for &(name, cpu, mem, disk, gpu, cost) in GPU_TYPES {
+                offerings.push(gpu_offering(
+                    name,
+                    cpu,
+                    mem,
+                    disk,
+                    gpu,
+                    GpuModel::NvidiaA100,
+                    cost,
+                    loc.clone(),
+                ));
+            }
+        }
+
+        offerings
     }
     pub async fn create(
         &self,
@@ -175,7 +206,7 @@ impl KwokProvider {
         nodes
             .delete(&node_id.0, &DeleteParams::default())
             .await
-            .map_err(|e| ProviderError::CreationFailed {
+            .map_err(|e| ProviderError::DeletionFailed {
                 message: e.to_string(),
             })?;
         Ok(())

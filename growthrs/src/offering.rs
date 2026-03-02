@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::ParseIntError;
 
 use k8s_openapi::api::core::v1::Pod;
@@ -5,6 +6,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 /// Label key used to match pods to NodePools via nodeSelector.
 pub const POOL_LABEL: &str = "growth.vettrdev.com/pool";
@@ -12,6 +14,12 @@ pub const NODE_REQUEST_LABEL: &str = "growth.vettrdev.com/node-request";
 pub const INSTANCE_TYPE_LABEL: &str = "growth.vettrdev.com/instance-type";
 /// NVIDIA GPU Feature Discovery label for the GPU product/model.
 pub const GPU_PRODUCT_LABEL: &str = "nvidia.com/gpu.product";
+/// Annotation set on nodes that are candidates for removal.
+pub const REMOVAL_CANDIDATE_ANNOTATION: &str = "growth.vettrdev.com/removal-candidate";
+/// Taint key applied to nodes being scaled down (NoSchedule effect).
+pub const SCALE_DOWN_TAINT_KEY: &str = "growth.vettrdev.com/scale-down";
+/// Annotation recording when a node is scheduled for deletion (RFC 3339 timestamp).
+pub const DELETE_AT_ANNOTATION: &str = "growth.vettrdev.com/delete-at";
 
 #[derive(Debug, Error)]
 #[error("failed to parse quantity \"{raw}\": {source}")]
@@ -27,6 +35,8 @@ pub struct Offering {
     pub resources: Resources,
     /// Hourly cost in USD.
     pub cost_per_hour: f64,
+    /// Where this offering physically lives (region + optional zone).
+    pub location: Location,
 }
 
 /// Where the instance physically lives.
@@ -87,8 +97,12 @@ pub struct PodResources {
     /// Kubernetes object UID, used to track which pods a NodeRequest claims.
     pub uid: String,
     pub resources: Resources,
-    /// Pool name from the pod's `nodeSelector["growth.dev/pool"]`, if any.
+    /// Pool name from the pod's `nodeSelector["growth.vettrdev.com/pool"]`, if any.
     pub pool: Option<String>,
+    /// Labels from the pod's metadata, used for affinity matching.
+    pub pod_labels: BTreeMap<String, String>,
+    /// Parsed affinity/anti-affinity constraints from the pod spec.
+    pub affinity_constraints: Vec<AffinityConstraint>,
 }
 
 /// Read the pool selector from a pod's nodeSelector.
@@ -185,6 +199,32 @@ impl From<String> for GpuModel {
     }
 }
 
+/// Whether this is an affinity or anti-affinity constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffinityKind {
+    Affinity,
+    AntiAffinity,
+}
+
+/// Whether the constraint is hard (required) or soft (preferred).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffinityStrength {
+    Required,
+    Preferred,
+}
+
+/// A parsed pod affinity/anti-affinity constraint.
+///
+/// Covers both `requiredDuringSchedulingIgnoredDuringExecution` and
+/// `preferredDuringSchedulingIgnoredDuringExecution` rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffinityConstraint {
+    pub kind: AffinityKind,
+    pub strength: AffinityStrength,
+    pub topology_key: String,
+    pub match_labels: BTreeMap<String, String>,
+}
+
 /// Parse a Kubernetes CPU quantity into whole vCPU count (rounds up).
 /// Handles: bare integers ("4"), millicores ("500m").
 fn parse_cpu(q: &Quantity) -> Result<u32, QuantityParseError> {
@@ -248,6 +288,12 @@ impl PodResources {
     /// Build a `PodResources` from a Kubernetes Pod, extracting name/namespace
     /// and summing resource requests across all containers.
     pub fn from_pod(pod: &Pod) -> Result<PodResources, QuantityParseError> {
+        let pod_labels = pod
+            .metadata
+            .labels
+            .clone()
+            .unwrap_or_default();
+        let affinity_constraints = parse_affinity_constraints(pod);
         Ok(PodResources {
             id: PodId {
                 namespace: pod.metadata.namespace.clone().unwrap_or_default(),
@@ -256,8 +302,119 @@ impl PodResources {
             uid: pod.metadata.uid.clone().unwrap_or_default(),
             resources: Resources::from_pod(pod)?,
             pool: pod_pool_selector(pod).map(|s| s.to_string()),
+            pod_labels,
+            affinity_constraints,
         })
     }
+}
+
+/// Parse affinity and anti-affinity rules from a pod spec into `AffinityConstraint`s.
+///
+/// Handles both `requiredDuringSchedulingIgnoredDuringExecution` and
+/// `preferredDuringSchedulingIgnoredDuringExecution` rules.
+/// Only `matchLabels` is supported; `matchExpressions` triggers a warning.
+pub fn parse_affinity_constraints(pod: &Pod) -> Vec<AffinityConstraint> {
+    let mut constraints = Vec::new();
+
+    let Some(affinity) = pod.spec.as_ref().and_then(|s| s.affinity.as_ref()) else {
+        return constraints;
+    };
+
+    // Anti-affinity — required
+    if let Some(anti) = &affinity.pod_anti_affinity {
+        if let Some(terms) = &anti.required_during_scheduling_ignored_during_execution {
+            for term in terms {
+                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                    warn!(pod = ?pod.metadata.name, "matchExpressions in anti-affinity not supported, only matchLabels");
+                }
+                let match_labels = term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_labels.clone())
+                    .unwrap_or_default();
+                if !match_labels.is_empty() {
+                    constraints.push(AffinityConstraint {
+                        kind: AffinityKind::AntiAffinity,
+                        strength: AffinityStrength::Required,
+                        topology_key: term.topology_key.clone(),
+                        match_labels,
+                    });
+                }
+            }
+        }
+
+        // Anti-affinity — preferred
+        if let Some(terms) = &anti.preferred_during_scheduling_ignored_during_execution {
+            for weighted in terms {
+                let term = &weighted.pod_affinity_term;
+                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                    warn!(pod = ?pod.metadata.name, "matchExpressions in preferred anti-affinity not supported, only matchLabels");
+                }
+                let match_labels = term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_labels.clone())
+                    .unwrap_or_default();
+                if !match_labels.is_empty() {
+                    constraints.push(AffinityConstraint {
+                        kind: AffinityKind::AntiAffinity,
+                        strength: AffinityStrength::Preferred,
+                        topology_key: term.topology_key.clone(),
+                        match_labels,
+                    });
+                }
+            }
+        }
+    }
+
+    // Affinity — required
+    if let Some(aff) = &affinity.pod_affinity {
+        if let Some(terms) = &aff.required_during_scheduling_ignored_during_execution {
+            for term in terms {
+                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                    warn!(pod = ?pod.metadata.name, "matchExpressions in affinity not supported, only matchLabels");
+                }
+                let match_labels = term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_labels.clone())
+                    .unwrap_or_default();
+                if !match_labels.is_empty() {
+                    constraints.push(AffinityConstraint {
+                        kind: AffinityKind::Affinity,
+                        strength: AffinityStrength::Required,
+                        topology_key: term.topology_key.clone(),
+                        match_labels,
+                    });
+                }
+            }
+        }
+
+        // Affinity — preferred
+        if let Some(terms) = &aff.preferred_during_scheduling_ignored_during_execution {
+            for weighted in terms {
+                let term = &weighted.pod_affinity_term;
+                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                    warn!(pod = ?pod.metadata.name, "matchExpressions in preferred affinity not supported, only matchLabels");
+                }
+                let match_labels = term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_labels.clone())
+                    .unwrap_or_default();
+                if !match_labels.is_empty() {
+                    constraints.push(AffinityConstraint {
+                        kind: AffinityKind::Affinity,
+                        strength: AffinityStrength::Preferred,
+                        topology_key: term.topology_key.clone(),
+                        match_labels,
+                    });
+                }
+            }
+        }
+    }
+
+    constraints
 }
 
 impl Resources {
@@ -518,6 +675,13 @@ mod tests {
         assert!(Resources::from_pod(&pod).is_err());
     }
 
+    fn test_location() -> Location {
+        Location {
+            region: Region("eu-central".into()),
+            zone: Some(Zone("fsn1-dc14".into())),
+        }
+    }
+
     #[test]
     fn satisfies_exact_match() {
         let offering = Offering {
@@ -530,6 +694,7 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.0066,
+            location: test_location(),
         };
         let demand = Resources {
             cpu: 2,
@@ -553,6 +718,7 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.0106,
+            location: test_location(),
         };
         let demand = Resources {
             cpu: 2,
@@ -576,6 +742,7 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.0044,
+            location: test_location(),
         };
         let demand = Resources {
             cpu: 2,
@@ -602,6 +769,7 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.0106,
+            location: test_location(),
         };
         let small_offering = Offering {
             instance_type: InstanceType("cx11".to_string()),
@@ -613,6 +781,7 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.0044,
+            location: test_location(),
         };
 
         assert!(good_offering.satisfies(&demand));

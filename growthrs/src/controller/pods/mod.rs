@@ -11,8 +11,8 @@ use kube::{Api, Client};
 use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
-use crate::node_pool::NodePool;
-use crate::node_request::{NodeRequest, NodeRequestPhase, NodeRequestSpec, create_node_request};
+use crate::crds::node_pool::NodePool;
+use crate::crds::node_request::{NodeRequest, NodeRequestPhase, NodeRequestSpec, create_node_request};
 use crate::offering::{INSTANCE_TYPE_LABEL, POOL_LABEL};
 use crate::providers::provider::Provider;
 
@@ -96,10 +96,28 @@ async fn get_node_pools(client: Client) -> Result<Vec<PoolConfig>> {
         .list(&lp)
         .await?
         .into_iter()
-        .map(|np| PoolConfig {
-            name: np.metadata.name.clone().unwrap_or_default(),
-            uid: np.metadata.uid.clone().unwrap_or_default(),
-            server_types: np.spec.server_types,
+        .filter_map(|np| {
+            let name = match np.metadata.name.clone() {
+                Some(n) => n,
+                None => {
+                    warn!("skipping NodePool with missing name");
+                    return None;
+                }
+            };
+            let uid = match np.metadata.uid.clone() {
+                Some(u) => u,
+                None => {
+                    warn!(pool = %name, "skipping NodePool with missing uid");
+                    return None;
+                }
+            };
+            Some(PoolConfig {
+                name,
+                uid,
+                server_types: np.spec.server_types,
+                labels: np.spec.labels,
+                locations: np.spec.locations,
+            })
         })
         .collect())
 }
@@ -262,8 +280,29 @@ async fn gather_cluster_state(
     })
 }
 
+/// Build initial PendingClaims from existing NodeRequests in the cluster.
+///
+/// On startup, seeds the cache with pod UIDs claimed by non-Unmet NRs so
+/// the first reconcile doesn't duplicate work already tracked by the API.
+pub async fn gather_pending_claims(client: &Client) -> Result<PendingClaims> {
+    let api: Api<NodeRequest> = Api::all(client.clone());
+    let nrs = api.list(&ListParams::default()).await?;
+    let mut claims = PendingClaims::new();
+    let uids: Vec<String> = nrs
+        .into_iter()
+        .filter(|nr| nr.phase() != NodeRequestPhase::Unmet)
+        .flat_map(|nr| nr.spec.claimed_pod_uids)
+        .collect();
+    if !uids.is_empty() {
+        debug!(count = uids.len(), "seeded pending_claims from existing NodeRequests");
+        claims.record(uids);
+    }
+    Ok(claims)
+}
+
 /// One-shot reconcile: gather state, solve, and create any needed NodeRequests.
 #[instrument(skip_all, fields(reconcile_id = %uuid::Uuid::new_v4()))]
+#[allow(unused_variables, unused_assignments)] // nr_creates used only with failpoints
 pub async fn reconcile_unschedulable_pods(
     client: Client,
     provider: &Provider,
@@ -276,7 +315,12 @@ pub async fn reconcile_unschedulable_pods(
         warn!(pod = %err.pod_id, reason = %err.reason, "pod could not be assigned to a pool");
     }
 
+    let mut nr_creates = 0usize;
     for demand in result.demands {
+        fail::fail_point!("reconcile_after_nr_create", |_| {
+            Err(ReconcileError::FaultInjected(nr_creates))
+        });
+
         let claimed_uids = demand.claimed_pod_uids.clone();
         create_node_request(
             client.clone(),
@@ -290,6 +334,7 @@ pub async fn reconcile_unschedulable_pods(
             },
         )
         .await?;
+        nr_creates += 1;
         // API create succeeded — record UIDs so the next reconcile (which may
         // run before the API list reflects this NR) still filters these pods.
         pending_claims.record(claimed_uids);
@@ -304,6 +349,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use http::{Request, Response};
+
     use k8s_openapi::api::core::v1::{
         Container, Pod, PodCondition, PodSpec, PodStatus, ResourceRequirements,
     };
@@ -495,6 +541,7 @@ mod tests {
     }
 
     fn test_offering(name: &str, cpu: u32, memory_mib: u32, cost: f64) -> Offering {
+        use crate::offering::{Location, Region, Zone};
         Offering {
             instance_type: InstanceType(name.into()),
             resources: Resources {
@@ -505,6 +552,10 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: cost,
+            location: Location {
+                region: Region("eu-central".into()),
+                zone: Some(Zone("fsn1-dc14".into())),
+            },
         }
     }
 
@@ -751,6 +802,74 @@ mod tests {
         assert!(
             pending_claims.contains("uid-retry-pod"),
             "new NR should re-populate pending_claims"
+        );
+    }
+
+    /// When the only NodePool in the cluster has no metadata.name,
+    /// `get_node_pools` should skip it. The pending pod then has no pool
+    /// to bind to, so zero NodeRequests are created.
+    #[tokio::test]
+    async fn nameless_pool_is_skipped() {
+        let (client, mut handle) = mock_client();
+        let provider = Provider::Fake(
+            FakeProvider::new().with_offerings(vec![test_offering("cx22", 2, 4096, 0.01)]),
+        );
+
+        let pod = make_pending_unschedulable_pod("orphan-pod", "1", "2048Mi");
+        let nr_count = Arc::new(AtomicUsize::new(0));
+        let nr_count_inner = nr_count.clone();
+
+        // Mock API: returns a NodePool list where the only pool has no name.
+        tokio::spawn(async move {
+            while let Some((request, send)) = handle.next_request().await {
+                let path = request.uri().path().to_string();
+                let method = request.method().clone();
+                if path.contains("/pods") {
+                    send.send_response(pod_list_response(vec![pod.clone()]));
+                } else if path.contains("nodepools") && method == http::Method::GET {
+                    // Pool with name omitted — should be skipped by filter_map.
+                    let list = serde_json::json!({
+                        "apiVersion": "growth.vettrdev.com/v1alpha1",
+                        "kind": "NodePoolList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": [{
+                            "apiVersion": "growth.vettrdev.com/v1alpha1",
+                            "kind": "NodePool",
+                            "metadata": {
+                                "resourceVersion": "1",
+                                "uid": "pool-uid-no-name"
+                            },
+                            "spec": {
+                                "serverTypes": [{ "name": "cx22", "max": 100, "min": 0 }]
+                            }
+                        }]
+                    });
+                    send.send_response(
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&list).unwrap()))
+                            .unwrap(),
+                    );
+                } else if path.contains("noderequests") && method == http::Method::GET {
+                    send.send_response(node_request_list_response(&[]));
+                } else if path.contains("noderequests") && method == http::Method::POST {
+                    nr_count_inner.fetch_add(1, Ordering::SeqCst);
+                    send.send_response(node_request_create_response());
+                } else if path.contains("/nodes") && method == http::Method::GET {
+                    send.send_response(node_list_response());
+                } else {
+                    panic!("unexpected request: {method} {path}");
+                }
+            }
+        });
+
+        let result =
+            reconcile_unschedulable_pods(client, &provider, &mut PendingClaims::new()).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            nr_count.load(Ordering::SeqCst),
+            0,
+            "nameless pool should be skipped — pod has no pool, so no NR is created"
         );
     }
 }

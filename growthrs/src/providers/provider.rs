@@ -12,6 +12,8 @@ pub struct NodeId(pub String);
 pub struct InstanceConfig {
     /// Extra labels to apply to the created node.
     pub labels: BTreeMap<String, String>,
+    /// Resolved user-data to pass to the provider (cloud-init, Talos config, etc.).
+    pub user_data: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +22,10 @@ pub enum ProviderError {
     /// Bad permissions, quota exceeded, invalid config, etc.
     #[error("creation failed: {message}")]
     CreationFailed { message: String },
+
+    /// The provider couldn't delete the resource.
+    #[error("deletion failed: {message}")]
+    DeletionFailed { message: String },
 
     /// Resource was created but the node never joined the cluster.
     /// The provider should attempt cleanup before returning this.
@@ -34,6 +40,10 @@ pub enum ProviderError {
     /// e.g. EKS without iam_identity, Hetzner without a way to bootstrap.
     #[error("missing required config: {field}")]
     MissingConfig { field: &'static str },
+
+    /// The requested provider name doesn't match any known implementation.
+    #[error("unknown provider: {0}")]
+    UnknownProvider(String),
 
     /// Underlying API/network error.
     #[error(transparent)]
@@ -64,6 +74,14 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Build a provider by name.  Errors if the name is unrecognised.
+    pub fn from_name(name: &str, client: kube::Client) -> Result<Self, ProviderError> {
+        match name {
+            "kwok" => Ok(Self::Kwok(KwokProvider::new(client))),
+            other => Err(ProviderError::UnknownProvider(other.to_string())),
+        }
+    }
+
     pub async fn offerings(&self) -> Vec<Offering> {
         match self {
             Self::Kwok(p) => p.offerings().await,

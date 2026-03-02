@@ -6,7 +6,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 
-use growthrs::offering::{InstanceType, Offering, Resources};
+use growthrs::offering::{InstanceType, Location, Offering, Region, Resources, Zone};
 
 pub fn pending_pod(name: &str, cpu: &str, memory: &str) -> Pod {
     Pod {
@@ -57,5 +57,9 @@ pub fn test_offering(name: &str, cpu: u32, memory_mib: u32, cost: f64) -> Offeri
             gpu_model: None,
         },
         cost_per_hour: cost,
+        location: Location {
+            region: Region("eu-central".into()),
+            zone: Some(Zone("fsn1-dc14".into())),
+        },
     }
 }

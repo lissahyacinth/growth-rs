@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +58,7 @@ pub enum OfferingsBehavior {
 pub struct CreateCall {
     pub offering: Offering,
     pub result_node_id: Option<NodeId>,
+    pub config_labels: BTreeMap<String, String>,
 }
 
 /// Logged record of a `delete()` call.
@@ -204,7 +205,7 @@ impl FakeProvider {
         &self,
         node_id: String,
         offering: &Offering,
-        _config: &InstanceConfig,
+        config: &InstanceConfig,
     ) -> Result<NodeId, ProviderError> {
         let behavior = {
             let mut state = self.state.lock().unwrap();
@@ -239,6 +240,7 @@ impl FakeProvider {
         self.state.lock().unwrap().create_calls.push(CreateCall {
             offering: offering.clone(),
             result_node_id,
+            config_labels: config.labels.clone(),
         });
 
         result
@@ -259,7 +261,7 @@ impl FakeProvider {
 
         match behavior {
             DeleteBehavior::Succeed | DeleteBehavior::Noop => Ok(()),
-            DeleteBehavior::Fail(msg) => Err(ProviderError::CreationFailed { message: msg }),
+            DeleteBehavior::Fail(msg) => Err(ProviderError::DeletionFailed { message: msg }),
         }
     }
 
@@ -288,7 +290,7 @@ impl FakeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offering::{InstanceType, Resources};
+    use crate::offering::{InstanceType, Location, Region, Resources, Zone};
 
     fn test_offering() -> Offering {
         Offering {
@@ -301,6 +303,10 @@ mod tests {
                 gpu_model: None,
             },
             cost_per_hour: 0.01,
+            location: Location {
+                region: Region("eu-central".into()),
+                zone: Some(Zone("fsn1-dc14".into())),
+            },
         }
     }
 

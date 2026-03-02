@@ -1,8 +1,12 @@
 pub mod node;
+pub mod node_removal;
 pub mod node_requests;
 pub mod pods;
+mod config;
 mod helpers;
+pub use config::ScaleDownConfig;
 pub(crate) use helpers::update_node_request_phase;
+use helpers::wait_for_crds;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +14,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::runtime::Controller;
 use kube::runtime::watcher;
 use kube::{Api, Client};
@@ -18,26 +21,23 @@ use tokio::time::{Instant, sleep};
 use tracing::{debug, info, warn};
 
 use crate::controller::node::node_controller;
-use crate::node_request::{NodeRequest};
+use crate::crds::node_removal_request::NodeRemovalRequest;
+use crate::crds::node_request::NodeRequest;
 use crate::optimiser;
 use crate::providers::provider::Provider;
 
 // Re-export for external consumers (integration tests, main.rs).
 pub use pods::{
     ClusterState, NodeRequestDemand, PodPoolError, PoolConfig, ReconcileResult,
-    reconcile_unschedulable_pods, reconcile_pods,
+    gather_pending_claims, reconcile_unschedulable_pods, reconcile_pods,
 };
-
-const CUSTOM_RESOURCE_DEFINITIONS: [&'static str; 3] = [
-    "noderequests.growth.vettrdev.com",
-    "nodepools.growth.vettrdev.com",
-    "noderemovalrequests.growth.vettrdev.com",
-];
 
 /// Shared context for the controller reconciler.
 pub struct ControllerContext {
     pub client: Client,
     pub provider: Provider,
+    pub provisioning_timeout: Duration,
+    pub scale_down: ScaleDownConfig,
 }
 
 /// Error type for reconciliation failures.
@@ -49,51 +49,8 @@ pub enum ReconcileError {
     Solver(#[from] optimiser::SolveError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-}
-
-/// Loop until CRDs are installed on Cluster
-async fn wait_for_crds(client: Client) -> Result<()> {
-    let api: Api<CustomResourceDefinition> = Api::all(client);
-    let mut crd_stablised: Vec<bool> = vec![false; CUSTOM_RESOURCE_DEFINITIONS.len()];
-    loop {
-        for (crd_idx, crd_name) in CUSTOM_RESOURCE_DEFINITIONS.iter().enumerate() {
-            if crd_stablised[crd_idx] {
-                continue;
-            }
-            if let Some(crd) = api.get_opt(crd_name).await? {
-                let established = crd
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.conditions.as_ref())
-                    .map(|conditions| {
-                        conditions
-                            .iter()
-                            .any(|c| c.type_ == "Established" && c.status == "True")
-                    })
-                    .unwrap_or(false);
-                if established {
-                    crd_stablised[crd_idx] = true;
-                    if crd_stablised.iter().all(|f| *f) {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        let missing_crds: String = CUSTOM_RESOURCE_DEFINITIONS
-            .iter()
-            .zip(crd_stablised.iter())
-            .filter_map(|(crd, stabilised)| {
-                if !*stabilised {
-                    Some(crd.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        warn!(missing = %missing_crds, "CRDs not yet established, retrying in 5s");
-        sleep(Duration::from_secs(5)).await;
-    }
+    #[error("fault injection triggered after {0} NR creates")]
+    FaultInjected(usize),
 }
 
 /// Watch Pending pods and reconcile in batched windows.
@@ -101,8 +58,8 @@ async fn wait_for_crds(client: Client) -> Result<()> {
 /// Events are coalesced so that a burst of pods becoming unschedulable
 /// produces a single reconcile against fresh API state, avoiding duplicate
 /// NodeRequests from stale informer caches.
-async fn run_pod_watcher(client: Client, provider: &Provider) -> Result<()> {
-    let pods: Api<Pod> = Api::all(client.clone());
+async fn run_pod_watcher(ctx: &ControllerContext) -> Result<()> {
+    let pods: Api<Pod> = Api::all(ctx.client.clone());
     let config = watcher::Config::default().fields("status.phase=Pending");
     let mut stream = std::pin::pin!(watcher::watcher(pods, config));
 
@@ -112,7 +69,7 @@ async fn run_pod_watcher(client: Client, provider: &Provider) -> Result<()> {
     let mut delay = ::std::pin::pin!(sleep(timeout));
     let mut pending = false;
 
-    let mut pending_claims = pods::PendingClaims::new();
+    let mut pending_claims = pods::gather_pending_claims(&ctx.client).await?;
 
     loop {
         tokio::select! {
@@ -136,23 +93,43 @@ async fn run_pod_watcher(client: Client, provider: &Provider) -> Result<()> {
             _ = &mut delay, if pending => {
                 pending = false;
                 info!(trigger = "batch_timeout", "starting pod reconciliation");
-                if let Err(e) = pods::reconcile_unschedulable_pods(client.clone(), provider, &mut pending_claims).await {
-                    warn!(error = %e, "pod reconciliation failed");
-                    sleep(Duration::from_secs(5)).await;
+                match pods::reconcile_unschedulable_pods(ctx.client.clone(), &ctx.provider, &mut pending_claims).await {
+                    Ok(()) => {}
+                    Err(ReconcileError::FaultInjected(n)) => {
+                        warn!(n, "fault injection triggered, exiting watcher");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "pod reconciliation failed");
+                        sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
             _ = &mut max_delay, if pending => {
                 pending = false;
                 info!(trigger = "max_window", "starting pod reconciliation");
-                if let Err(e) = pods::reconcile_unschedulable_pods(client.clone(), provider, &mut pending_claims).await {
-                    warn!(error = %e, "pod reconciliation failed");
-                    sleep(Duration::from_secs(5)).await;
+                match pods::reconcile_unschedulable_pods(ctx.client.clone(), &ctx.provider, &mut pending_claims).await {
+                    Ok(()) => {}
+                    Err(ReconcileError::FaultInjected(n)) => {
+                        warn!(n, "fault injection triggered, exiting watcher");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "pod reconciliation failed");
+                        sleep(Duration::from_secs(5)).await;
+                    }
                 }
                 delay.as_mut().reset(Instant::now() + timeout);
             }
         }
     }
     Ok(())
+}
+
+/// Run only the pod watcher — exposed for integration tests that need
+/// to spawn and abort the watcher to simulate crash/restart cycles.
+pub async fn run_pod_watcher_standalone(ctx: Arc<ControllerContext>) -> Result<()> {
+    run_pod_watcher(&ctx).await
 }
 
 /// Run the per-object NodeRequest controller.
@@ -171,9 +148,26 @@ async fn run_node_request_controller(ctx: Arc<ControllerContext>) -> Result<()> 
     Ok(())
 }
 
+/// Run the per-object NodeRemovalRequest controller.
+async fn run_node_removal_request_controller(ctx: Arc<ControllerContext>) -> Result<()> {
+    let nrrs: Api<NodeRemovalRequest> = Api::all(ctx.client.clone());
+    let config = watcher::Config::default();
+    let mut stream = std::pin::pin!(Controller::new(nrrs, config).run(
+        node_removal::reconcile_node_removal_request,
+        node_removal::error_policy,
+        ctx.clone(),
+    ));
+    while let Some(result) = stream.next().await {
+        let (obj, _) = result.context("node_removal_request controller stream error")?;
+        debug!(name = %obj.name, "reconciled NodeRemovalRequest")
+    }
+    Ok(())
+}
+
 /// Run the event-driven controllers.
 ///
-/// Starts watches for Pending Pods and NodeRequests concurrently.
+/// Starts watches for Pending Pods, NodeRequests, Nodes, and NodeRemovalRequests concurrently.
+/// Also runs the periodic idle-node scanner for scale-down.
 pub async fn run(ctx: ControllerContext) -> Result<(), anyhow::Error> {
     wait_for_crds(ctx.client.clone()).await?;
     info!("all CRDs established, starting controller watches");
@@ -181,7 +175,7 @@ pub async fn run(ctx: ControllerContext) -> Result<(), anyhow::Error> {
     let ctx = Arc::new(ctx);
 
     tokio::select! {
-        res = run_pod_watcher(ctx.client.clone(), &ctx.provider) => {
+        res = run_pod_watcher(&ctx) => {
             res.context("pod watcher failed")?
         }
         res = run_node_request_controller(ctx.clone()) => {
@@ -189,6 +183,12 @@ pub async fn run(ctx: ControllerContext) -> Result<(), anyhow::Error> {
         }
         res = node_controller(ctx.clone()) => {
             res.context("node controller failed")?
+        }
+        res = run_node_removal_request_controller(ctx.clone()) => {
+            res.context("node_removal_request controller failed")?
+        }
+        res = node_removal::run_idle_node_scanner(&ctx) => {
+            res.context("idle node scanner failed")?
         }
     }
     Ok(())

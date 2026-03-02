@@ -12,11 +12,15 @@ serde_json = "1"
 thiserror = "2.0.18"
 anyhow = "1.0.101"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1.21.0", features = ["v4"] }
+uuid = { version = "1.21.0", features = ["v4", "v7"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-good_lp = { version = "1", default-features = false, features = ["highs"] }
 futures-util = "0.3"
+fail = "0.5"
+hcloud = {version="0.25.0", default-features=false, features=["rustls-tls"]}
+
+[features]
+failpoints = ["fail/failpoints"]
 
 [dev-dependencies]
 tower-test = "0.4"

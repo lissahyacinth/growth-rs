@@ -11,7 +11,7 @@ use kube::Api;
 use kube::runtime::controller::Action;
 use tracing::{debug, info, warn};
 
-use crate::node_request::{NodeRequest, NodeRequestPhase};
+use crate::crds::node_request::{NodeRequest, NodeRequestPhase};
 use crate::offering::NODE_REQUEST_LABEL;
 
 use super::{ControllerContext, update_node_request_phase};

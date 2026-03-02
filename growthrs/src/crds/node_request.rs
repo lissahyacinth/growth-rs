@@ -9,7 +9,7 @@ use crate::offering::Resources;
 /// Spec for a NodeRequest — a request to provision a single node.
 ///
 /// NodeRequests track individual node provisioning through a state machine:
-/// Pending → Provisioning → Ready | Unmet
+/// Pending → Provisioning → Ready | Unmet | Deprovisioning
 ///
 /// They are owned by a NodePool and cleaned up via TTL once Ready or Unmet.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -133,101 +133,3 @@ pub struct NodeRequestStatus {
     pub events: Vec<NodeRequestEvent>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::offering::Resources;
-    use kube::CustomResourceExt;
-
-    #[test]
-    fn crd_generates_valid_schema() {
-        let crd = NodeRequest::crd();
-        assert_eq!(
-            crd.metadata.name.as_deref(),
-            Some("noderequests.growth.vettrdev.com")
-        );
-
-        let spec = &crd.spec;
-        assert_eq!(spec.group, "growth.vettrdev.com");
-        assert_eq!(spec.names.kind, "NodeRequest");
-        assert_eq!(spec.names.plural, "noderequests");
-    }
-
-    #[test]
-    fn status_defaults_to_pending() {
-        let status = NodeRequestStatus::default();
-        assert_eq!(status.phase, NodeRequestPhase::Pending);
-        assert!(status.events.is_empty());
-    }
-
-    #[test]
-    fn phase_display() {
-        assert_eq!(NodeRequestPhase::Pending.to_string(), "Pending");
-        assert_eq!(NodeRequestPhase::Provisioning.to_string(), "Provisioning");
-        assert_eq!(NodeRequestPhase::Ready.to_string(), "Ready");
-        assert_eq!(NodeRequestPhase::Unmet.to_string(), "Unmet");
-    }
-
-    #[test]
-    fn spec_roundtrips_through_json() {
-        let spec = NodeRequestSpec {
-            target_offering: "hetzner-cax11".to_string(),
-            resources: Resources {
-                cpu: 2,
-                memory_mib: 4096,
-                ephemeral_storage_gib: None,
-                gpu: 0,
-                gpu_model: None,
-            },
-            node_id: "example".to_string(),
-            claimed_pod_uids: vec!["uid-1".to_string(), "uid-2".to_string()],
-        };
-        let json = serde_json::to_string(&spec).unwrap();
-        let back: NodeRequestSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.target_offering, "hetzner-cax11");
-        assert_eq!(back.resources.cpu, 2);
-        assert_eq!(back.resources.memory_mib, 4096);
-        assert_eq!(back.claimed_pod_uids, vec!["uid-1", "uid-2"]);
-    }
-
-    #[test]
-    fn full_node_request_serialization() {
-        let nr = NodeRequest::new(
-            "test-nr",
-            NodeRequestSpec {
-                target_offering: "cx22".to_string(),
-                resources: Resources {
-                    cpu: 2,
-                    memory_mib: 4096,
-                    ephemeral_storage_gib: None,
-                    gpu: 0,
-                    gpu_model: None,
-                },
-                node_id: "example".to_string(),
-                claimed_pod_uids: vec![],
-            },
-        );
-        let json = serde_json::to_value(&nr).unwrap();
-        let resources = &json["spec"]["resources"];
-        assert_eq!(resources["memoryMib"], 4096);
-        assert_eq!(resources["cpu"], 2);
-    }
-
-    #[test]
-    fn status_roundtrips_through_json() {
-        let status = NodeRequestStatus {
-            phase: NodeRequestPhase::Provisioning,
-            events: vec![NodeRequestEvent {
-                at: "2026-01-01T21:07:52Z".to_string(),
-                name: "nodeRequested".to_string(),
-                reason: None,
-            }],
-        };
-        let json = serde_json::to_string(&status).unwrap();
-        let back: NodeRequestStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.phase, NodeRequestPhase::Provisioning);
-        assert_eq!(back.events.len(), 1);
-        assert_eq!(back.events[0].name, "nodeRequested");
-    }
-}
