@@ -3,12 +3,14 @@ use std::collections::BTreeMap;
 use kube::{Api, Client};
 use tracing::{debug, info, warn};
 
+use crate::crds::hetzner_node_class::HetznerNodeClass;
 use crate::crds::node_pool::NodePool;
 use crate::crds::node_request::NodeRequest;
 use crate::offering::{
     INSTANCE_TYPE_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE, NODE_REQUEST_LABEL, POOL_LABEL,
 };
-use crate::providers::provider::{InstanceConfig, ProviderError};
+use crate::providers::hetzner::config::HetznerCreateConfig;
+use crate::providers::provider::{InstanceConfig, Provider, ProviderCreateConfig, ProviderError};
 
 use super::{ControllerContext, ProvisionOutcome};
 use crate::controller::errors::ControllerError;
@@ -28,6 +30,8 @@ async fn get_pool_info(client: &Client, nr: &NodeRequest) -> PoolInfo {
         .and_then(|refs| refs.iter().find(|r| r.kind == "NodePool"))
         .map(|r| r.name.clone());
 
+    // TODO: What is the handling behaviour here? If there's no NodePool for a NodeRequest, what
+    // behaviour is expected?
     let Some(name) = pool_name else {
         return PoolInfo {
             labels: BTreeMap::new(),
@@ -42,6 +46,7 @@ async fn get_pool_info(client: &Client, nr: &NodeRequest) -> PoolInfo {
             node_class_ref: np.spec.node_class_ref,
         },
         Ok(None) => {
+            // FIXME/TODO: This feels worse than a default! This seems like an error.
             debug!(pool = %name, "owning NodePool not found, using empty labels");
             PoolInfo {
                 labels: BTreeMap::new(),
@@ -62,7 +67,11 @@ pub(super) async fn attempt_provision(
     nr: &NodeRequest,
     ctx: &ControllerContext,
 ) -> Result<ProvisionOutcome, ControllerError> {
-    let name = nr.metadata.name.as_deref().unwrap_or("<unknown>");
+    let name = nr
+        .metadata
+        .name
+        .as_deref()
+        .ok_or(ControllerError::MissingName("NodeRequest"))?;
     let offerings = ctx.provider.offerings().await;
     let Some(offering) = offerings.iter().find(|o| {
         o.instance_type.0 == nr.spec.target_offering && o.location.region.0 == nr.spec.location
@@ -77,23 +86,60 @@ pub(super) async fn attempt_provision(
     };
 
     let pool_info = get_pool_info(&ctx.client, nr).await;
-
     // Build generic labels (provider-agnostic).
     let config = build_labels(nr, &pool_info.labels);
 
-    // Resolve provider-specific config from CRDs.
-    let provider_config = ctx
-        .provider
-        .resolve_create_config(
-            &ctx.client,
-            &pool_info.node_class_ref,
-            offering,
-            &config.labels,
-        )
-        .await
-        .map_err(|e| {
-            ControllerError::Other(anyhow::anyhow!("provider config resolution failed: {e}"))
-        })?;
+    // Resolve provider-specific config from CRDs at the controller level.
+    // The controller matches on the provider variant to decide which
+    // NodeClass CRD to fetch, keeping provider-specific types out of
+    // the generic Provider interface.
+    let provider_config = match &ctx.provider {
+        Provider::Hetzner(_) => {
+            let class_ref =
+                pool_info
+                    .node_class_ref
+                    .as_ref()
+                    .ok_or(ControllerError::Other(anyhow::anyhow!(
+                        "Hetzner pools require a nodeClassRef"
+                    )))?;
+            let node_class = kube::Api::<HetznerNodeClass>::all(ctx.client.clone())
+                .get(&class_ref.name)
+                .await
+                .map_err(|e| {
+                    ControllerError::Other(anyhow::anyhow!(
+                        "HetznerNodeClass {:?} not found: {e}",
+                        class_ref.name
+                    ))
+                })?;
+
+            let user_data = node_class
+                .spec
+                .user_data
+                .resolve(&ctx.client, offering, &config.labels)
+                .await
+                .map_err(|e| {
+                    ControllerError::Other(anyhow::anyhow!(
+                        "user-data resolution failed: {e}"
+                    ))
+                })?;
+
+            if node_class.spec.network_ids.is_empty() {
+                warn!("HetznerNodeClass has no network_ids — servers will have public networking only");
+            }
+
+            ProviderCreateConfig::Hetzner(HetznerCreateConfig {
+                user_data: Some(user_data),
+                image: node_class.spec.image.clone(),
+                ssh_key_names: node_class.spec.ssh_key_names.clone(),
+                network_ids: node_class.spec.network_ids.clone(),
+                firewall_ids: node_class.spec.firewall_ids.clone(),
+                enable_ipv4: node_class.spec.enable_ipv4,
+                enable_ipv6: node_class.spec.enable_ipv6,
+                hetzner_labels: node_class.spec.hetzner_labels.clone(),
+            })
+        }
+        Provider::Kwok(_) | Provider::Fake(_) => ProviderCreateConfig::None,
+    };
 
     info!(
         name,
