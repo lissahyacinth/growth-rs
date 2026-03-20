@@ -12,6 +12,11 @@ use tracing::warn;
 pub const POOL_LABEL: &str = "growth.vettrdev.com/pool";
 pub const NODE_REQUEST_LABEL: &str = "growth.vettrdev.com/node-request";
 pub const INSTANCE_TYPE_LABEL: &str = "growth.vettrdev.com/instance-type";
+/// Label identifying nodes managed by the growth operator.
+pub const MANAGED_BY_LABEL: &str = "growth.vettrdev.com/managed-by";
+pub const MANAGED_BY_VALUE: &str = "growth";
+/// Label selector for listing growth-managed nodes.
+pub const MANAGED_BY_SELECTOR: &str = "growth.vettrdev.com/managed-by=growth";
 /// NVIDIA GPU Feature Discovery label for the GPU product/model.
 pub const GPU_PRODUCT_LABEL: &str = "nvidia.com/gpu.product";
 /// Annotation set on nodes that are candidates for removal.
@@ -142,17 +147,33 @@ impl Resources {
         let gpu_model_ok = need
             .gpu_model
             .as_ref()
-            .map_or(true, |needed| self.gpu_model.as_ref() == Some(needed));
+            .is_none_or(|needed| self.gpu_model.as_ref() == Some(needed));
 
         let storage_ok = need
             .ephemeral_storage_gib
-            .map_or(true, |req| self.ephemeral_storage_gib.is_some_and(|avail| avail >= req));
+            .is_none_or(|req| self.ephemeral_storage_gib.is_some_and(|avail| avail >= req));
 
         self.cpu >= need.cpu
             && self.memory_mib >= need.memory_mib
             && self.gpu >= need.gpu
             && gpu_model_ok
             && storage_ok
+    }
+
+    /// Subtract consumed resources from available capacity.
+    ///
+    /// Caller must check `satisfies()` first — this will underflow if
+    /// consumed exceeds available.
+    pub fn subtract(&mut self, consumed: &Resources) {
+        self.cpu -= consumed.cpu;
+        self.memory_mib -= consumed.memory_mib;
+        if let (Some(avail), Some(used)) = (
+            &mut self.ephemeral_storage_gib,
+            consumed.ephemeral_storage_gib,
+        ) {
+            *avail -= used;
+        }
+        self.gpu -= consumed.gpu;
     }
 }
 
@@ -288,11 +309,7 @@ impl PodResources {
     /// Build a `PodResources` from a Kubernetes Pod, extracting name/namespace
     /// and summing resource requests across all containers.
     pub fn from_pod(pod: &Pod) -> Result<PodResources, QuantityParseError> {
-        let pod_labels = pod
-            .metadata
-            .labels
-            .clone()
-            .unwrap_or_default();
+        let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
         let affinity_constraints = parse_affinity_constraints(pod);
         Ok(PodResources {
             id: PodId {
@@ -324,7 +341,12 @@ pub fn parse_affinity_constraints(pod: &Pod) -> Vec<AffinityConstraint> {
     if let Some(anti) = &affinity.pod_anti_affinity {
         if let Some(terms) = &anti.required_during_scheduling_ignored_during_execution {
             for term in terms {
-                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                if term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_expressions.as_ref())
+                    .is_some_and(|e| !e.is_empty())
+                {
                     warn!(pod = ?pod.metadata.name, "matchExpressions in anti-affinity not supported, only matchLabels");
                 }
                 let match_labels = term
@@ -347,7 +369,12 @@ pub fn parse_affinity_constraints(pod: &Pod) -> Vec<AffinityConstraint> {
         if let Some(terms) = &anti.preferred_during_scheduling_ignored_during_execution {
             for weighted in terms {
                 let term = &weighted.pod_affinity_term;
-                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                if term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_expressions.as_ref())
+                    .is_some_and(|e| !e.is_empty())
+                {
                     warn!(pod = ?pod.metadata.name, "matchExpressions in preferred anti-affinity not supported, only matchLabels");
                 }
                 let match_labels = term
@@ -371,7 +398,12 @@ pub fn parse_affinity_constraints(pod: &Pod) -> Vec<AffinityConstraint> {
     if let Some(aff) = &affinity.pod_affinity {
         if let Some(terms) = &aff.required_during_scheduling_ignored_during_execution {
             for term in terms {
-                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                if term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_expressions.as_ref())
+                    .is_some_and(|e| !e.is_empty())
+                {
                     warn!(pod = ?pod.metadata.name, "matchExpressions in affinity not supported, only matchLabels");
                 }
                 let match_labels = term
@@ -394,7 +426,12 @@ pub fn parse_affinity_constraints(pod: &Pod) -> Vec<AffinityConstraint> {
         if let Some(terms) = &aff.preferred_during_scheduling_ignored_during_execution {
             for weighted in terms {
                 let term = &weighted.pod_affinity_term;
-                if term.label_selector.as_ref().and_then(|ls| ls.match_expressions.as_ref()).is_some_and(|e| !e.is_empty()) {
+                if term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|ls| ls.match_expressions.as_ref())
+                    .is_some_and(|e| !e.is_empty())
+                {
                     warn!(pod = ?pod.metadata.name, "matchExpressions in preferred affinity not supported, only matchLabels");
                 }
                 let match_labels = term
@@ -786,5 +823,70 @@ mod tests {
 
         assert!(good_offering.satisfies(&demand));
         assert!(!small_offering.satisfies(&demand));
+    }
+
+    #[test]
+    fn subtract_basic_cpu_memory() {
+        let mut capacity = Resources {
+            cpu: 4,
+            memory_mib: 8192,
+            ephemeral_storage_gib: None,
+            gpu: 0,
+            gpu_model: None,
+        };
+        let consumed = Resources {
+            cpu: 1,
+            memory_mib: 2048,
+            ephemeral_storage_gib: None,
+            gpu: 0,
+            gpu_model: None,
+        };
+        capacity.subtract(&consumed);
+        assert_eq!(capacity.cpu, 3);
+        assert_eq!(capacity.memory_mib, 6144);
+    }
+
+    #[test]
+    fn subtract_to_zero() {
+        let mut capacity = Resources {
+            cpu: 2,
+            memory_mib: 4096,
+            ephemeral_storage_gib: Some(40),
+            gpu: 1,
+            gpu_model: Some(GpuModel::NvidiaT4),
+        };
+        let consumed = Resources {
+            cpu: 2,
+            memory_mib: 4096,
+            ephemeral_storage_gib: Some(40),
+            gpu: 1,
+            gpu_model: Some(GpuModel::NvidiaT4),
+        };
+        capacity.subtract(&consumed);
+        assert_eq!(capacity.cpu, 0);
+        assert_eq!(capacity.memory_mib, 0);
+        assert_eq!(capacity.ephemeral_storage_gib, Some(0));
+        assert_eq!(capacity.gpu, 0);
+    }
+
+    #[test]
+    fn subtract_ephemeral_storage_none_consumed() {
+        let mut capacity = Resources {
+            cpu: 4,
+            memory_mib: 8192,
+            ephemeral_storage_gib: Some(80),
+            gpu: 0,
+            gpu_model: None,
+        };
+        let consumed = Resources {
+            cpu: 1,
+            memory_mib: 2048,
+            ephemeral_storage_gib: None,
+            gpu: 0,
+            gpu_model: None,
+        };
+        capacity.subtract(&consumed);
+        // ephemeral_storage_gib unchanged when consumed is None
+        assert_eq!(capacity.ephemeral_storage_gib, Some(80));
     }
 }
