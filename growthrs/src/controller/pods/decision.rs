@@ -26,8 +26,6 @@ pub struct NodeRequestDemand {
     pub pool: String,
     pub pool_uid: String,
     pub target_offering: Offering,
-    /// UIDs of the pods this node is being provisioned for.
-    pub claimed_pod_uids: Vec<String>,
     /// Labels from the owning NodePool, to be applied to the provisioned node.
     pub labels: BTreeMap<String, String>,
 }
@@ -269,25 +267,13 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
             );
         }
 
-        // Build PodId → UID mapping so we can record which pods each NodeRequest claims.
-        let uid_map: HashMap<&PodId, &str> = pool_demands
-            .iter()
-            .map(|pr| (&pr.id, pr.uid.as_str()))
-            .collect();
-
         let new_demands: Vec<_> = nodes
             .into_iter()
             .map(|node| {
-                let claimed_pod_uids = node
-                    .pods
-                    .iter()
-                    .filter_map(|pid| uid_map.get(pid).map(|u| u.to_string()))
-                    .collect();
                 NodeRequestDemand {
                     pool: pool_name.clone(),
                     pool_uid: pool.uid.clone(),
                     target_offering: node.offering,
-                    claimed_pod_uids,
                     labels: pool.labels.clone(),
                 }
             })
@@ -397,20 +383,6 @@ mod tests {
         );
         let result = reconcile_pods(state).unwrap();
         assert_eq!(result.demands.len(), 1);
-    }
-
-    #[test]
-    fn demands_carry_claimed_pod_uids() {
-        let state = default_state(
-            vec![pod("a", 1, 1024), pod("b", 1, 1024)],
-            vec![offering("cpx22", 2, 4096, 0.01)],
-        );
-        let result = reconcile_pods(state).unwrap();
-        // Both pods fit on one cpx22 node.
-        assert_eq!(result.demands.len(), 1);
-        let mut uids = result.demands[0].claimed_pod_uids.clone();
-        uids.sort();
-        assert_eq!(uids, vec!["uid-a", "uid-b"]);
     }
 
     // --- Pool assignment tests ---
