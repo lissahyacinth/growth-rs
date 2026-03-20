@@ -1,13 +1,27 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use k8s_openapi::api::core::v1::Pod;
 use tracing::{debug, warn};
 
+use crate::controller::errors::PodPoolError;
 use crate::crds::node_pool::{LocationConstraint, ServerTypeConfig};
-use crate::offering::{Offering, PodId, PodResources};
-use crate::optimiser::{BoundedOffering, PlacementSolution, SolveError, SolveOptions, solve};
+use crate::offering::{Offering, PodId, PodResources, Resources};
+use crate::optimiser::{BoundedOffering, PlacementSolution, SolveError, solve};
+
+/// In-flight NodeRequest capacity used for resource-based deduplication.
+///
+/// Each entry represents a Pending, Provisioning, or young-Unmet NodeRequest.
+/// `subtract_in_flight` absorbs pods into this capacity so the solver only
+/// sees residual demand.
+#[derive(Debug, Clone)]
+pub struct InFlightCapacity {
+    /// Pool this NodeRequest belongs to.
+    pub pool: String,
+    /// Snapshot of the resources this NodeRequest provides.
+    pub resources: Resources,
+}
 
 #[derive(Debug)]
+/// An (unfilled) request for a single node
 pub struct NodeRequestDemand {
     pub pool: String,
     pub pool_uid: String,
@@ -30,13 +44,6 @@ pub struct PoolConfig {
     pub locations: Option<Vec<LocationConstraint>>,
 }
 
-/// A pod that could not be assigned to any pool.
-#[derive(Debug)]
-pub struct PodPoolError {
-    pub pod_id: crate::offering::PodId,
-    pub reason: String,
-}
-
 /// Result of a reconciliation pass.
 #[derive(Debug)]
 pub struct ReconcileResult {
@@ -45,39 +52,18 @@ pub struct ReconcileResult {
 }
 
 pub struct ClusterState {
+    /// Current demands within this reconcilliation decision
     pub demands: Vec<PodResources>,
+    /// Offerings from the Provider - what we can use to fulfil demands
     pub offerings: Vec<Offering>,
     /// Number of occupied slots per pool per instance type.
     /// Includes existing nodes + Pending/Provisioning NodeRequests.
     pub occupied_counts: HashMap<String, HashMap<String, u32>>,
-    /// Available pools from NodePool CRDs.
+    /// Available pools generated from NodePool CRDs.
     pub pools: Vec<PoolConfig>,
 }
 
-/// Check whether a Pod has the `PodScheduled=False/Unschedulable` condition.
-pub fn is_pod_unschedulable(pod: &Pod) -> bool {
-    pod.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .map(|conditions| {
-            conditions.iter().any(|c| {
-                c.type_ == "PodScheduled"
-                    && c.status == "False"
-                    && c.reason.as_deref() == Some("Unschedulable")
-            })
-        })
-        .unwrap_or(false)
-}
-
-pub fn is_daemonset_pod(pod: &Pod) -> bool {
-    pod.metadata
-        .owner_references
-        .as_ref()
-        .map(|refs| refs.iter().any(|r| r.kind == "DaemonSet"))
-        .unwrap_or(false)
-}
-
-/// Assign pods to pools based on their `pool` selector.
+/// Assign pod demands to offered pools based on their `pool` selector.
 ///
 /// - Pod has `pool: Some(name)` and pool exists -> assigned
 /// - Pod has `pool: Some(name)` and pool doesn't exist -> PodPoolError
@@ -140,6 +126,51 @@ pub fn filter_offerings_for_pool(offerings: &[Offering], pool: &PoolConfig) -> V
         .collect()
 }
 
+/// Subtract in-flight NodeRequest capacity from pod demand.
+///
+/// For each in-flight NodeRequest, greedily absorbs pods (largest-first)
+/// whose pool matches and whose resources fit. Returns the residual pods
+/// that still need new NodeRequests.
+///
+/// Imprecision is expected: the simulation may absorb different pods than
+/// Kubernetes actually schedules. The convergence model handles this —
+/// idle removal cleans up over-provisioning, the next loop catches
+/// under-provisioning.
+pub fn subtract_in_flight(
+    mut pods: Vec<PodResources>,
+    in_flight: &[InFlightCapacity],
+) -> Vec<PodResources> {
+    if in_flight.is_empty() {
+        return pods;
+    }
+
+    // Sort largest-first (by cpu descending, then memory descending) for greedy packing.
+    pods.sort_by(|a, b| {
+        b.resources
+            .cpu
+            .cmp(&a.resources.cpu)
+            .then(b.resources.memory_mib.cmp(&a.resources.memory_mib))
+    });
+
+    for cap in in_flight {
+        let mut remaining = cap.resources.clone();
+        pods.retain(|pod| {
+            let pool_matches = pod
+                .pool
+                .as_deref()
+                .map_or(cap.pool == "default", |p| p == cap.pool);
+            if pool_matches && remaining.satisfies(&pod.resources) {
+                remaining.subtract(&pod.resources);
+                false // absorbed by in-flight capacity
+            } else {
+                true // still needs placement
+            }
+        });
+    }
+
+    pods
+}
+
 pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError> {
     let (pods_by_pool, pod_errors) = assign_pods_to_pools(&state.demands, &state.pools);
 
@@ -158,7 +189,7 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
 
         let pool_offerings = filter_offerings_for_pool(&state.offerings, pool);
 
-        // Subtract occupied slots (existing nodes + pending/provisioning NRs)
+        // Subtract occupied slots (existing nodes + pending/provisioning NodeRequests)
         // from each type's max so the solver only provisions what the pool
         // can still accept.
         let occupied = state.occupied_counts.get(pool_name.as_str());
@@ -210,10 +241,7 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
                     o.location.region.0.clone(),
                 );
                 if let Some(ref z) = o.location.zone {
-                    labels.insert(
-                        "topology.kubernetes.io/zone".into(),
-                        z.0.clone(),
-                    );
+                    labels.insert("topology.kubernetes.io/zone".into(), z.0.clone());
                 }
 
                 BoundedOffering {
@@ -225,8 +253,7 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
             })
             .collect();
 
-        let options = SolveOptions::default();
-        let solution = solve(pool_demands, &suitable, &options)?;
+        let solution = solve(pool_demands, &suitable)?;
 
         let (nodes, unmet) = match solution {
             PlacementSolution::NoDemands => continue,
@@ -242,7 +269,7 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
             );
         }
 
-        // Build PodId → UID mapping so we can record which pods each NR claims.
+        // Build PodId → UID mapping so we can record which pods each NodeRequest claims.
         let uid_map: HashMap<&PodId, &str> = pool_demands
             .iter()
             .map(|pr| (&pr.id, pr.uid.as_str()))
@@ -345,10 +372,7 @@ mod tests {
         }
     }
 
-    fn default_state(
-        demands: Vec<PodResources>,
-        offerings: Vec<Offering>,
-    ) -> ClusterState {
+    fn default_state(demands: Vec<PodResources>, offerings: Vec<Offering>) -> ClusterState {
         let pool = default_pool(
             offerings
                 .iter()
@@ -369,7 +393,7 @@ mod tests {
         // receives only unclaimed pods and solves for all of them.
         let state = default_state(
             vec![pod("a", 1, 1024)],
-            vec![offering("cx22", 2, 4096, 0.01)],
+            vec![offering("cpx22", 2, 4096, 0.01)],
         );
         let result = reconcile_pods(state).unwrap();
         assert_eq!(result.demands.len(), 1);
@@ -379,10 +403,10 @@ mod tests {
     fn demands_carry_claimed_pod_uids() {
         let state = default_state(
             vec![pod("a", 1, 1024), pod("b", 1, 1024)],
-            vec![offering("cx22", 2, 4096, 0.01)],
+            vec![offering("cpx22", 2, 4096, 0.01)],
         );
         let result = reconcile_pods(state).unwrap();
-        // Both pods fit on one cx22 node.
+        // Both pods fit on one cpx22 node.
         assert_eq!(result.demands.len(), 1);
         let mut uids = result.demands[0].claimed_pod_uids.clone();
         uids.sort();
@@ -474,7 +498,7 @@ mod tests {
             name: "small".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 10,
                 min: 0,
             }],
@@ -482,12 +506,12 @@ mod tests {
             locations: None,
         };
         let offerings = vec![
-            offering("cx22", 2, 4096, 0.01),
+            offering("cpx22", 2, 4096, 0.01),
             offering("cx42", 8, 16384, 0.05),
         ];
         let filtered = filter_offerings_for_pool(&offerings, &pool);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].instance_type.0, "cx22");
+        assert_eq!(filtered[0].instance_type.0, "cpx22");
     }
 
     // --- Full reconcile with pools ---
@@ -498,7 +522,7 @@ mod tests {
             name: "workers".to_string(),
             uid: "workers-uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 10,
                 min: 0,
             }],
@@ -507,7 +531,7 @@ mod tests {
         };
         let state = ClusterState {
             demands: vec![pod_with_pool("a", 1, 1024, "workers")],
-            offerings: vec![offering("cx22", 2, 4096, 0.01)],
+            offerings: vec![offering("cpx22", 2, 4096, 0.01)],
             occupied_counts: HashMap::new(),
             pools: vec![pool],
         };
@@ -524,7 +548,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 10,
                 min: 0,
             }],
@@ -533,7 +557,7 @@ mod tests {
         };
         let state = ClusterState {
             demands: vec![pod_with_pool("a", 1, 1024, "nonexistent")],
-            offerings: vec![offering("cx22", 2, 4096, 0.01)],
+            offerings: vec![offering("cpx22", 2, 4096, 0.01)],
             occupied_counts: HashMap::new(),
             pools: vec![pool],
         };
@@ -544,13 +568,13 @@ mod tests {
 
     #[test]
     fn occupied_slots_subtracted_from_pool_max() {
-        // Pool max=2 for cx22, 1 already occupied (existing node or in-flight NR).
+        // Pool max=2 for cpx22, 1 already occupied (existing node or in-flight NodeRequest).
         // 3 pods each need their own node → solver can only create 1 more.
         let pool = PoolConfig {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 2,
                 min: 0,
             }],
@@ -559,10 +583,10 @@ mod tests {
         };
         let state = ClusterState {
             demands: vec![pod("a", 2, 4096), pod("b", 2, 4096), pod("c", 2, 4096)],
-            offerings: vec![offering("cx22", 2, 4096, 0.01)],
+            offerings: vec![offering("cpx22", 2, 4096, 0.01)],
             occupied_counts: HashMap::from([(
                 "default".to_string(),
-                HashMap::from([("cx22".to_string(), 1)]),
+                HashMap::from([("cpx22".to_string(), 1)]),
             )]),
             pools: vec![pool],
         };
@@ -600,7 +624,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -611,9 +635,9 @@ mod tests {
             }]),
         };
         let offerings = vec![
-            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
-            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("b")),
-            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west", Some("b")),
+            offering_in("cpx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
         ];
         let state = ClusterState {
             demands: vec![pod("a", 1, 1024)],
@@ -624,12 +648,14 @@ mod tests {
         let result = reconcile_pods(state).unwrap();
         assert_eq!(result.demands.len(), 1);
         // The selected offering must be in us-west
-        assert!(result.demands[0]
-            .target_offering
-            .location
-            .region
-            .0
-            .starts_with("us-west"));
+        assert!(
+            result.demands[0]
+                .target_offering
+                .location
+                .region
+                .0
+                .starts_with("us-west")
+        );
     }
 
     #[test]
@@ -639,7 +665,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -650,9 +676,9 @@ mod tests {
             }]),
         };
         let offerings = vec![
-            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
-            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("b")),
-            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west", Some("b")),
+            offering_in("cpx22", 2, 4096, 0.01, "eu-central", Some("a")),
         ];
         let state = ClusterState {
             demands: vec![pod("a", 1, 1024)],
@@ -675,7 +701,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -692,19 +718,15 @@ mod tests {
             ]),
         };
         let offerings = vec![
-            offering_in("cx22", 2, 4096, 0.01, "us-west4", Some("a")),
-            offering_in("cx22", 2, 4096, 0.01, "us-west4", Some("b")),
-            offering_in("cx22", 2, 4096, 0.01, "us-west2", Some("a")),
-            offering_in("cx22", 2, 4096, 0.01, "us-west2", Some("b")), // should be filtered
-            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("x")), // wrong region
+            offering_in("cpx22", 2, 4096, 0.01, "us-west4", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west4", Some("b")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west2", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west2", Some("b")), // should be filtered
+            offering_in("cpx22", 2, 4096, 0.01, "eu-central", Some("x")), // wrong region
         ];
         // 4 pods to force multiple nodes → proves multiple offerings pass
         let state = ClusterState {
-            demands: vec![
-                pod("a", 2, 4096),
-                pod("b", 2, 4096),
-                pod("c", 2, 4096),
-            ],
+            demands: vec![pod("a", 2, 4096), pod("b", 2, 4096), pod("c", 2, 4096)],
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
@@ -732,7 +754,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -740,8 +762,8 @@ mod tests {
             locations: None,
         };
         let offerings = vec![
-            offering_in("cx22", 2, 4096, 0.01, "us-west", Some("a")),
-            offering_in("cx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
+            offering_in("cpx22", 2, 4096, 0.01, "us-west", Some("a")),
+            offering_in("cpx22", 2, 4096, 0.01, "eu-central", Some("fsn1")),
         ];
         let state = ClusterState {
             demands: vec![pod("a", 1, 1024)],
@@ -760,7 +782,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -771,7 +793,7 @@ mod tests {
             }]),
         };
         // Offering has no zone — should not pass a constraint that lists specific zones
-        let offerings = vec![offering_in("cx22", 2, 4096, 0.01, "us-west", None)];
+        let offerings = vec![offering_in("cpx22", 2, 4096, 0.01, "us-west", None)];
         let state = ClusterState {
             demands: vec![pod("a", 1, 1024)],
             offerings,
@@ -792,7 +814,7 @@ mod tests {
             name: "default".to_string(),
             uid: "uid".to_string(),
             server_types: vec![ServerTypeConfig {
-                name: "cx22".to_string(),
+                name: "cpx22".to_string(),
                 max: 100,
                 min: 0,
             }],
@@ -803,7 +825,7 @@ mod tests {
             }]),
         };
         // Offering has no zone — region-only constraint should accept it
-        let offerings = vec![offering_in("cx22", 2, 4096, 0.01, "us-west", None)];
+        let offerings = vec![offering_in("cpx22", 2, 4096, 0.01, "us-west", None)];
         let state = ClusterState {
             demands: vec![pod("a", 1, 1024)],
             offerings,
@@ -812,5 +834,84 @@ mod tests {
         };
         let result = reconcile_pods(state).unwrap();
         assert_eq!(result.demands.len(), 1);
+    }
+
+    // --- subtract_in_flight tests ---
+
+    fn in_flight(pool: &str, cpu: u32, memory_mib: u32) -> InFlightCapacity {
+        InFlightCapacity {
+            pool: pool.to_string(),
+            resources: res(cpu, memory_mib),
+        }
+    }
+
+    #[test]
+    fn subtract_empty_in_flight_passes_all_pods() {
+        let pods = vec![pod("a", 1, 1024), pod("b", 2, 2048)];
+        let result = subtract_in_flight(pods, &[]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn subtract_exact_match_absorbs_all() {
+        let pods = vec![pod("a", 1, 1024), pod("b", 1, 1024)];
+        let cap = vec![in_flight("default", 2, 4096)];
+        let result = subtract_in_flight(pods, &cap);
+        assert!(result.is_empty(), "both pods should be absorbed");
+    }
+
+    #[test]
+    fn subtract_partial_coverage_leaves_residual() {
+        let pods = vec![pod("a", 1, 1024), pod("b", 1, 1024), pod("c", 1, 1024)];
+        let cap = vec![in_flight("default", 2, 4096)];
+        let result = subtract_in_flight(pods, &cap);
+        assert_eq!(result.len(), 1, "one pod should remain");
+    }
+
+    #[test]
+    fn subtract_pod_too_large_passes_through() {
+        let pods = vec![pod("big", 4, 8192)];
+        let cap = vec![in_flight("default", 2, 4096)];
+        let result = subtract_in_flight(pods, &cap);
+        assert_eq!(result.len(), 1, "oversized pod should not be absorbed");
+    }
+
+    #[test]
+    fn subtract_respects_pool_boundaries() {
+        let pods = vec![pod_with_pool("a", 1, 1024, "gpu")];
+        let cap = vec![in_flight("cpu", 4, 8192)];
+        let result = subtract_in_flight(pods, &cap);
+        assert_eq!(result.len(), 1, "wrong pool should not absorb");
+    }
+
+    #[test]
+    fn subtract_largest_first_packing() {
+        let pods = vec![pod("small", 1, 1024), pod("big", 2, 2048)];
+        let cap = vec![in_flight("default", 2, 4096)];
+        let result = subtract_in_flight(pods, &cap);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.name, "small");
+    }
+
+    #[test]
+    fn subtract_gpu_demand_only_absorbed_by_gpu_capacity() {
+        use crate::offering::GpuModel;
+        let gpu_pod = PodResources {
+            id: PodId::new("default", "gpu-job"),
+            uid: "uid-gpu".into(),
+            resources: Resources {
+                cpu: 1,
+                memory_mib: 4096,
+                ephemeral_storage_gib: None,
+                gpu: 1,
+                gpu_model: Some(GpuModel::NvidiaT4),
+            },
+            pool: None,
+            pod_labels: BTreeMap::new(),
+            affinity_constraints: vec![],
+        };
+        let cap = vec![in_flight("default", 4, 16384)];
+        let result = subtract_in_flight(vec![gpu_pod], &cap);
+        assert_eq!(result.len(), 1, "GPU pod should not be absorbed by non-GPU capacity");
     }
 }
