@@ -63,7 +63,11 @@ impl RecentCreates {
         });
         let drained = before - self.entries.len();
         if drained > 0 {
-            debug!(drained, remaining = self.entries.len(), "drained recent_creates");
+            debug!(
+                drained,
+                remaining = self.entries.len(),
+                "drained recent_creates"
+            );
         }
     }
 
@@ -348,7 +352,7 @@ mod tests {
     use crate::providers::fake::FakeProvider;
     use crate::providers::provider::Provider;
 
-    use super::{PendingClaims, reconcile_unschedulable_pods};
+    use super::{RecentCreates, reconcile_unschedulable_pods};
 
     type ApiServerHandle = tower_test::mock::Handle<Request<Body>, Response<Body>>;
 
@@ -394,8 +398,7 @@ mod tests {
                     "ephemeralStorageGib": null,
                     "gpu": 0,
                     "gpuModel": null
-                },
-                "claimedPodUids": []
+                }
             }
         });
         Response::builder()
@@ -419,8 +422,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Build a NodeRequest JSON value with a given phase and claimed pod UIDs.
-    fn make_nr_json(name: &str, phase: &str, claimed_uids: &[&str]) -> serde_json::Value {
+    /// Build a NodeRequest JSON value with a given name and phase.
+    fn make_nr_json(name: &str, phase: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "growth.vettrdev.com/v1alpha1",
             "kind": "NodeRequest",
@@ -445,8 +448,7 @@ mod tests {
                     "ephemeralStorageGib": null,
                     "gpu": 0,
                     "gpuModel": null
-                },
-                "claimedPodUids": claimed_uids
+                }
             },
             "status": {
                 "phase": phase
@@ -615,7 +617,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -637,7 +639,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -664,7 +666,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -695,7 +697,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -710,7 +712,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -720,8 +722,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_claims_prevent_duplicate_node_requests() {
-        // Two sequential calls share the same pending_claims. The mock API
+    async fn recent_creates_prevent_duplicate_node_requests() {
+        // Two sequential calls share the same recent_creates. The mock API
         // always returns an empty NodeRequest list (simulating API lag), so only the
         // in-memory cache prevents the second call from creating duplicates.
         let provider = Provider::Fake(
@@ -729,15 +731,15 @@ mod tests {
         );
         let pod = make_pending_unschedulable_pod("dup-pod", "1", "2048Mi");
 
-        let mut pending_claims = PendingClaims::default();
+        let mut recent_creates = RecentCreates::default();
 
-        // First call — should create 1 NodeRequest and populate pending_claims.
+        // First call — should create 1 NodeRequest and populate recent_creates.
         let (client1, handle1) = mock_client();
         let nr_count1 = spawn_mock_api(handle1, vec![pod.clone()], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut pending_claims,
+            &mut recent_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -749,18 +751,18 @@ mod tests {
             "first call should create 1 NodeRequest"
         );
         assert!(
-            pending_claims.contains("uid-dup-pod"),
-            "pending_claims should contain the pod UID after creation"
+            !recent_creates.is_empty(),
+            "recent_creates should have capacity recorded after first call"
         );
 
         // Second call — same pod still pending, empty NodeRequest list from API,
-        // but pending_claims should filter it out.
+        // but recent_creates capacity absorbed the pod demand via subtract_in_flight.
         let (client2, handle2) = mock_client();
         let nr_count2 = spawn_mock_api(handle2, vec![pod], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut pending_claims,
+            &mut recent_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -769,44 +771,47 @@ mod tests {
         assert_eq!(
             nr_count2.load(Ordering::SeqCst),
             0,
-            "second call should create 0 NodeRequests — pending_claims prevents duplicates"
+            "second call should create 0 NodeRequests — recent_creates prevents duplicates"
         );
     }
 
     #[tokio::test]
-    async fn pending_claims_drained_when_api_catches_up() {
+    async fn recent_creates_drained_when_api_catches_up() {
         let provider = Provider::Fake(
             FakeProvider::new().with_offerings(vec![test_offering("cpx22", 2, 4096, 0.01)]),
         );
         let pod = make_pending_unschedulable_pod("drain-pod", "1", "2048Mi");
 
-        let mut pending_claims = PendingClaims::default();
+        let mut recent_creates = RecentCreates::default();
 
-        // First call — empty NodeRequest list, creates 1 NodeRequest, populates pending_claims.
+        // First call — empty NodeRequest list, creates 1 NodeRequest, populates recent_creates.
         let (client1, handle1) = mock_client();
         let nr_count1 = spawn_mock_api(handle1, vec![pod.clone()], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut pending_claims,
+            &mut recent_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
         .await
         .unwrap();
         assert_eq!(nr_count1.load(Ordering::SeqCst), 1);
-        assert!(pending_claims.contains("uid-drain-pod"));
+        assert!(
+            !recent_creates.is_empty(),
+            "recent_creates should have an entry after first call"
+        );
 
-        // Second call — API now reflects the NodeRequest (Pending phase, claiming this UID).
-        // pending_claims should be drained, and the NodeRequest's claimed_pod_uids filters
-        // the pod from demand. No new NodeRequest created.
+        // Second call — API now reflects the NodeRequest (Pending phase). The API-listed NR
+        // absorbs the demand via in-flight resource subtraction, and recent_creates is drained
+        // because its name matches an API entry. No new NodeRequest created.
         let (client2, handle2) = mock_client();
-        let nr_items = vec![make_nr_json("nr-1", "Pending", &["uid-drain-pod"])];
+        let nr_items = vec![make_nr_json("test-nr", "Pending")];
         let nr_count2 = spawn_mock_api_with_nrs(handle2, vec![pod], vec!["cpx22"], nr_items);
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut pending_claims,
+            &mut recent_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -814,8 +819,8 @@ mod tests {
         .unwrap();
         assert_eq!(nr_count2.load(Ordering::SeqCst), 0);
         assert!(
-            pending_claims.is_empty(),
-            "pending_claims should be drained once the API reflects the NodeRequest"
+            recent_creates.is_empty(),
+            "recent_creates should be drained once the API reflects the NodeRequest"
         );
     }
 
@@ -826,20 +831,18 @@ mod tests {
         );
         let pod = make_pending_unschedulable_pod("retry-pod", "1", "2048Mi");
 
-        let mut pending_claims = PendingClaims::default();
-        // Seed pending_claims as if a previous reconcile created an NodeRequest for this pod.
-        pending_claims.record(["uid-retry-pod".to_string()]);
+        let mut recent_creates = RecentCreates::default();
 
-        // The NodeRequest is now Unmet — its UIDs appear in all_nr_uids (draining the cache)
-        // but NOT in claimed_pod_uids, so the pod re-enters demand.
+        // An Unmet NodeRequest exists in the API. With unmet_ttl=0 it is immediately
+        // expired and does not contribute to in-flight capacity, so the pod re-enters demand.
         let (client, handle) = mock_client();
-        let nr_items = vec![make_nr_json("nr-unmet", "Unmet", &["uid-retry-pod"])];
+        let nr_items = vec![make_nr_json("nr-unmet", "Unmet")];
         let nr_count = spawn_mock_api_with_nrs(handle, vec![pod], vec!["cpx22"], nr_items);
         reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut pending_claims,
-            Duration::from_secs(120),
+            &mut recent_creates,
+            Duration::from_secs(0),
             k8s_openapi::jiff::Timestamp::now(),
         )
         .await
@@ -849,11 +852,9 @@ mod tests {
             1,
             "pod should re-enter demand and produce a new NodeRequest"
         );
-        // The UID is back in pending_claims because the new NodeRequest was just created.
-        // The old Unmet NodeRequest's drain happened, then the new create re-populated it.
         assert!(
-            pending_claims.contains("uid-retry-pod"),
-            "new NodeRequest should re-populate pending_claims"
+            !recent_creates.is_empty(),
+            "new NodeRequest should populate recent_creates"
         );
     }
 
@@ -918,7 +919,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut PendingClaims::default(),
+            &mut RecentCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
