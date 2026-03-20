@@ -16,7 +16,7 @@ spec:
           properties:
             spec:
               type: object
-              required: ["targetOffering", "nodeID"]
+              required: ["targetOffering", "nodeID", "location"]
               properties:
                 nodeID:
                   type: string
@@ -24,6 +24,9 @@ spec:
                   pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
                 targetOffering:
                   type: string
+                location:
+                  type: string
+                  description: Provider location/region for this node, e.g. "nbg1".
                 resources:
                   type: object
                   required: ["cpu", "memoryMib", "gpu"]
@@ -38,11 +41,7 @@ spec:
                       type: integer
                     gpuModel:
                       type: string
-                claimedPodUids:
-                  type: array
-                  items:
-                    type: string
-                  default: []
+
             status:
               type: object
               properties:
@@ -253,7 +252,7 @@ spec:
                     templateRef:
                       type: object
                       required: ["name", "namespace", "key"]
-                      description: Secret containing the raw template.
+                      description: ConfigMap containing the raw template (e.g. cloud-init YAML).
                       properties:
                         name:
                           type: string

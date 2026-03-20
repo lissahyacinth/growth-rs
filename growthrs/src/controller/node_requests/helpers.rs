@@ -1,24 +1,25 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, Client};
 use tracing::{debug, info, warn};
 
-use crate::crds::hetzner_node_class::{HetznerNodeClass, UserDataError, resolve_template};
-use crate::crds::node_pool::{NodeClassRef, NodePool};
+use crate::crds::node_pool::NodePool;
 use crate::crds::node_request::NodeRequest;
-use crate::offering::{INSTANCE_TYPE_LABEL, NODE_REQUEST_LABEL, POOL_LABEL};
+use crate::offering::{
+    INSTANCE_TYPE_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE, NODE_REQUEST_LABEL, POOL_LABEL,
+};
 use crate::providers::provider::{InstanceConfig, ProviderError};
 
-use super::{ControllerContext, ProvisionOutcome, ReconcileError};
+use super::{ControllerContext, ProvisionOutcome};
+use crate::controller::errors::ControllerError;
 
 /// Information extracted from the owning NodePool.
 struct PoolInfo {
     labels: BTreeMap<String, String>,
-    node_class_ref: Option<NodeClassRef>,
+    node_class_ref: Option<crate::crds::node_pool::NodeClassRef>,
 }
 
-/// Look up the owning NodePool's labels and node_class_ref from the NR's ownerReference.
+/// Look up the owning NodePool's labels and node_class_ref from the NodeRequest's ownerReference.
 async fn get_pool_info(client: &Client, nr: &NodeRequest) -> PoolInfo {
     let pool_name = nr
         .metadata
@@ -57,95 +58,19 @@ async fn get_pool_info(client: &Client, nr: &NodeRequest) -> PoolInfo {
     }
 }
 
-/// Read a single key from a Kubernetes Secret.
-async fn read_secret_key(
-    client: &Client,
-    namespace: &str,
-    name: &str,
-    key: &str,
-) -> Result<String, UserDataError> {
-    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret = api.get(name).await.map_err(|e| UserDataError::SecretReadFailed {
-        secret_name: name.to_string(),
-        key: key.to_string(),
-        reason: e.to_string(),
-    })?;
-
-    let data = secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get(key))
-        .ok_or_else(|| UserDataError::SecretReadFailed {
-            secret_name: name.to_string(),
-            key: key.to_string(),
-            reason: format!("key {key:?} not found in secret"),
-        })?;
-
-    String::from_utf8(data.0.clone()).map_err(|e| UserDataError::SecretReadFailed {
-        secret_name: name.to_string(),
-        key: key.to_string(),
-        reason: format!("value is not valid UTF-8: {e}"),
-    })
-}
-
-/// Resolve user-data for a pool's node class reference.
-///
-/// Returns `Ok(None)` if no node class ref is set.
-/// Returns `Ok(Some(resolved))` with the fully-substituted template.
-/// Returns `Err` if the HetznerNodeClass is missing, Secrets can't be read,
-/// or template resolution fails.
-async fn resolve_user_data_for_pool(
-    client: &Client,
-    node_class_ref: &Option<NodeClassRef>,
-) -> Result<Option<String>, UserDataError> {
-    let Some(class_ref) = node_class_ref else {
-        return Ok(None);
-    };
-
-    let api: Api<HetznerNodeClass> = Api::all(client.clone());
-    let hnc = api
-        .get(&class_ref.name)
-        .await
-        .map_err(|_| UserDataError::NodeClassNotFound {
-            name: class_ref.name.clone(),
-        })?;
-
-    // Read the template from the referenced Secret.
-    let tpl_ref = &hnc.spec.user_data.template_ref;
-    let template = read_secret_key(client, &tpl_ref.namespace, &tpl_ref.name, &tpl_ref.key).await?;
-
-    // Read all variable values.
-    let mut variables = Vec::new();
-    if let Some(vars) = &hnc.spec.user_data.variables {
-        for var in vars {
-            let value = read_secret_key(
-                client,
-                &var.secret_ref.namespace,
-                &var.secret_ref.name,
-                &var.secret_ref.key,
-            )
-            .await?;
-            variables.push((var.name.clone(), value));
-        }
-    }
-
-    let resolved = resolve_template(&template, &variables)?;
-    Ok(Some(resolved))
-}
-
 pub(super) async fn attempt_provision(
     nr: &NodeRequest,
     ctx: &ControllerContext,
-) -> Result<ProvisionOutcome, ReconcileError> {
+) -> Result<ProvisionOutcome, ControllerError> {
     let name = nr.metadata.name.as_deref().unwrap_or("<unknown>");
     let offerings = ctx.provider.offerings().await;
-    let Some(offering) = offerings
-        .iter()
-        .find(|o| o.instance_type.0 == nr.spec.target_offering)
-    else {
+    let Some(offering) = offerings.iter().find(|o| {
+        o.instance_type.0 == nr.spec.target_offering && o.location.region.0 == nr.spec.location
+    }) else {
         warn!(
             name,
             target_offering = %nr.spec.target_offering,
+            location = %nr.spec.location,
             "no matching offering found in provider catalog"
         );
         return Ok(ProvisionOutcome::NoMatchingOffering);
@@ -153,17 +78,22 @@ pub(super) async fn attempt_provision(
 
     let pool_info = get_pool_info(&ctx.client, nr).await;
 
-    let user_data = match resolve_user_data_for_pool(&ctx.client, &pool_info.node_class_ref).await
-    {
-        Ok(ud) => ud,
-        Err(e) => {
-            return Err(ReconcileError::Other(anyhow::anyhow!(
-                "user-data resolution failed: {e}"
-            )));
-        }
-    };
+    // Build generic labels (provider-agnostic).
+    let config = build_labels(nr, &pool_info.labels);
 
-    let config = build_instance_config(nr, &pool_info.labels, user_data);
+    // Resolve provider-specific config from CRDs.
+    let provider_config = ctx
+        .provider
+        .resolve_create_config(
+            &ctx.client,
+            &pool_info.node_class_ref,
+            offering,
+            &config.labels,
+        )
+        .await
+        .map_err(|e| {
+            ControllerError::Other(anyhow::anyhow!("provider config resolution failed: {e}"))
+        })?;
 
     info!(
         name,
@@ -174,7 +104,7 @@ pub(super) async fn attempt_provision(
 
     match ctx
         .provider
-        .create(nr.spec.node_id.clone(), offering, &config)
+        .create(nr.spec.node_id.clone(), offering, &config, &provider_config)
         .await
     {
         Ok(_) => {
@@ -188,18 +118,18 @@ pub(super) async fn attempt_provision(
                 reason = %reason,
                 "offering unavailable from provider"
             );
-            Ok(ProvisionOutcome::OfferingUnavailable(reason))
+            Ok(ProvisionOutcome::OfferingUnavailable)
         }
-        Err(e) => Err(ReconcileError::Other(e.into())),
+        Err(e) => Err(ControllerError::Other(e.into())),
     }
 }
 
-pub(crate) fn build_instance_config(
-    nr: &NodeRequest,
-    pool_labels: &BTreeMap<String, String>,
-    user_data: Option<String>,
-) -> InstanceConfig {
+/// Build the generic InstanceConfig (labels only) for a NodeRequest.
+///
+/// Pure function — no I/O, no ControllerContext dependency.
+fn build_labels(nr: &NodeRequest, pool_labels: &BTreeMap<String, String>) -> InstanceConfig {
     let mut labels = pool_labels.clone();
+    labels.insert(MANAGED_BY_LABEL.to_string(), MANAGED_BY_VALUE.to_string());
     if let Some(pool_name) = nr
         .metadata
         .owner_references
@@ -221,11 +151,12 @@ pub(crate) fn build_instance_config(
         INSTANCE_TYPE_LABEL.to_string(),
         nr.spec.target_offering.clone(),
     );
-    InstanceConfig { labels, user_data }
+
+    InstanceConfig { labels }
 }
 
-pub(super) async fn delete_node_request(client: &Client, name: &str) -> Result<(), kube::Error> {
-    let api: Api<NodeRequest> = Api::all(client.clone());
+pub(super) async fn delete_node_request(client: Client, name: &str) -> Result<(), kube::Error> {
+    let api: Api<NodeRequest> = Api::all(client);
     match api.delete(name, &Default::default()).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(ref resp)) if resp.code == 404 => {
@@ -233,5 +164,101 @@ pub(super) async fn delete_node_request(client: &Client, name: &str) -> Result<(
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crds::node_request::{NodeRequestPhase, NodeRequestSpec, NodeRequestStatus};
+    use crate::offering::Resources;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn test_nr() -> NodeRequest {
+        NodeRequest {
+            metadata: ObjectMeta {
+                name: Some("nr-test".into()),
+                ..Default::default()
+            },
+            spec: NodeRequestSpec {
+                node_id: "node-1".into(),
+                target_offering: "cpx22".into(),
+                location: "fsn1".into(),
+                resources: Resources {
+                    cpu: 3,
+                    memory_mib: 4096,
+                    ephemeral_storage_gib: None,
+                    gpu: 0,
+                    gpu_model: None,
+                },
+            },
+            status: Some(NodeRequestStatus {
+                phase: NodeRequestPhase::Pending,
+                events: vec![],
+                last_transition_time: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn build_labels_includes_managed_by() {
+        let nr = test_nr();
+        let config = build_labels(&nr, &BTreeMap::new());
+        assert_eq!(
+            config.labels.get(MANAGED_BY_LABEL).unwrap(),
+            MANAGED_BY_VALUE
+        );
+    }
+
+    #[test]
+    fn build_labels_includes_instance_type() {
+        let nr = test_nr();
+        let config = build_labels(&nr, &BTreeMap::new());
+        assert_eq!(
+            config
+                .labels
+                .get("growth.vettrdev.com/instance-type")
+                .unwrap(),
+            "cpx22"
+        );
+    }
+
+    #[test]
+    fn build_labels_includes_pool_labels() {
+        let nr = test_nr();
+        let mut pool_labels = BTreeMap::new();
+        pool_labels.insert("custom-label".into(), "custom-value".into());
+        let config = build_labels(&nr, &pool_labels);
+        assert_eq!(config.labels.get("custom-label").unwrap(), "custom-value");
+    }
+
+    #[test]
+    fn build_labels_includes_node_request_name() {
+        let nr = test_nr();
+        let config = build_labels(&nr, &BTreeMap::new());
+        assert_eq!(
+            config
+                .labels
+                .get("growth.vettrdev.com/node-request")
+                .unwrap(),
+            "nr-test"
+        );
+    }
+
+    #[test]
+    fn reserved_name_collision_is_validated_at_resolve_time() {
+        use crate::crds::hetzner_node_class::RESERVED_DYNAMIC_VARS;
+
+        assert!(RESERVED_DYNAMIC_VARS.contains(&"REGION"));
+        assert!(RESERVED_DYNAMIC_VARS.contains(&"LOCATION"));
+        assert!(RESERVED_DYNAMIC_VARS.contains(&"INSTANCE_TYPE"));
+        assert!(RESERVED_DYNAMIC_VARS.contains(&"NODE_LABELS"));
+
+        // Verify the error type exists and formats correctly.
+        let err = crate::crds::hetzner_node_class::UserDataError::ReservedNameCollision {
+            name: "REGION".into(),
+        };
+        assert!(err.to_string().contains("REGION"));
+        assert!(err.to_string().contains("reserved"));
     }
 }

@@ -26,12 +26,11 @@ pub struct NodeRequestSpec {
     pub node_id: String,
     /// The offering (instance type) to provision, e.g. "hetzner-cax11".
     pub target_offering: String,
+    /// Provider location/region to provision in, e.g. "nbg1".
+    pub location: String,
     /// Snapshot of the resources this offering provides, captured at creation time.
     pub resources: Resources,
-    /// UIDs of the pods this NodeRequest was created to satisfy.
-    /// Used to prevent duplicate provisioning across reconcile loops.
-    #[serde(default)]
-    pub claimed_pod_uids: Vec<String>,
+
 }
 
 /// Create a NodeRequest in Pending phase for a given pool and offering.
@@ -68,7 +67,6 @@ pub async fn create_node_request(
         pool = %pool,
         offering = %nr.spec.target_offering,
         node_id = %nr.spec.node_id,
-        claimed_pods = nr.spec.claimed_pod_uids.len(),
         "created NodeRequest"
     );
     Ok(created)
@@ -90,7 +88,6 @@ impl NodeRequest {
 /// - `Provisioning` — provider accepted the request, node is being created.
 /// - `Ready` — node joined the cluster successfully.
 /// - `Unmet` — provider couldn't fulfil the request (no capacity). TTL-based cleanup.
-/// - `Deprovisioning` — node failed readiness check, being torn down.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub enum NodeRequestPhase {
     #[default]
@@ -98,7 +95,6 @@ pub enum NodeRequestPhase {
     Provisioning,
     Ready,
     Unmet,
-    Deprovisioning,
 }
 
 impl std::fmt::Display for NodeRequestPhase {
@@ -108,7 +104,6 @@ impl std::fmt::Display for NodeRequestPhase {
             Self::Provisioning => write!(f, "Provisioning"),
             Self::Ready => write!(f, "Ready"),
             Self::Unmet => write!(f, "Unmet"),
-            Self::Deprovisioning => write!(f, "Deprovisioning"),
         }
     }
 }
@@ -116,7 +111,7 @@ impl std::fmt::Display for NodeRequestPhase {
 /// A recorded event on a NodeRequest.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct NodeRequestEvent {
-    pub at: String,
+    pub at: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -131,5 +126,7 @@ pub struct NodeRequestStatus {
     /// Event log.
     #[serde(default)]
     pub events: Vec<NodeRequestEvent>,
+    /// Timestamp of the most recent phase transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
 }
-
