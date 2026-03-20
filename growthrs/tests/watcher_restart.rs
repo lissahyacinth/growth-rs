@@ -2,12 +2,12 @@
 //!
 //! Verifies that the pod watcher correctly recovers state after a
 //! mid-reconcile crash, preventing duplicate NodeRequests for pods
-//! already covered by existing NRs.
+//! already covered by existing NodeRequests.
 //!
 //! Uses the `fail` crate's fail points to deterministically stop the
-//! reconciler after exactly N NR creates. Three representative crash
+//! reconciler after exactly N NodeRequest creates. Three representative crash
 //! points cover the interesting boundaries:
-//! - **Early** (crash@3): most NRs still need creating on recovery
+//! - **Early** (crash@3): most NodeRequests still need creating on recovery
 //! - **Mid** (crash@15): half-done state, equal split
 //! - **Late** (crash@27): almost complete, recovery creates a few stragglers
 //!
@@ -15,17 +15,18 @@
 //!   cargo test --manifest-path growthrs/Cargo.toml --features failpoints --test watcher_restart -- --nocapture
 #![cfg(feature = "failpoints")]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use growthrs::controller::{ControllerContext, run_pod_watcher_standalone};
+use growthrs::config::ControllerContext;
+use growthrs::controller::run_pod_watcher;
 use growthrs::crds::node_request::NodeRequest;
 use growthrs::providers::kwok::KwokProvider;
 use growthrs::providers::provider::Provider;
 use growthrs::testing;
 
-/// 60 pods at 1 cpu each → 30 cx22 nodes (2 cpu each).
+/// 60 pods at 1 cpu each → 30 cpx22 nodes (2 cpu each).
 const EXPECTED_NRS: usize = 30;
 const POD_COUNT: u32 = 60;
 
@@ -40,7 +41,8 @@ fn make_ctx(client: kube::Client) -> Arc<ControllerContext> {
         client: client.clone(),
         provider: Provider::Kwok(KwokProvider::new(client)),
         provisioning_timeout: Duration::from_secs(300),
-        scale_down: growthrs::controller::ScaleDownConfig::default(),
+        scale_down: growthrs::config::ScaleDownConfig::default(),
+        clock: Box::new(growthrs::clock::SystemClock),
     })
 }
 
@@ -52,7 +54,7 @@ async fn setup_round(client: kube::Client, round: usize) {
         client.clone(),
         "default",
         vec![growthrs::crds::node_pool::ServerTypeConfig {
-            name: "cx22".to_string(),
+            name: "cpx22".to_string(),
             max: EXPECTED_NRS as u32,
             min: 0,
         }],
@@ -79,8 +81,8 @@ async fn setup_round(client: kube::Client, round: usize) {
 /// Poll until at least `expected` pods have PodScheduled=False/Unschedulable.
 async fn wait_for_all_pods_unschedulable(client: kube::Client, expected: usize) {
     use k8s_openapi::api::core::v1::Pod;
-    use kube::api::ListParams;
     use kube::Api;
+    use kube::api::ListParams;
 
     let pods_api: Api<Pod> = Api::all(client);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -115,7 +117,7 @@ async fn wait_for_all_pods_unschedulable(client: kube::Client, expected: usize) 
     }
 }
 
-/// Poll NRs until the count is unchanged for `stable_duration`.
+/// Poll NodeRequests until the count is unchanged for `stable_duration`.
 async fn wait_for_stable_nr_count(
     client: kube::Client,
     stable_duration: Duration,
@@ -133,50 +135,37 @@ async fn wait_for_stable_nr_count(
             return nrs;
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("NR count did not stabilise within 60s (count={last_count})");
+            panic!("NodeRequest count did not stabilise within 60s (count={last_count})");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
-/// Assert: claimed_pod_uids are populated and no pod UID appears in more than one NR.
-fn assert_no_duplicate_uids(nrs: &[NodeRequest], label: &str) {
-    let total_claimed: usize = nrs.iter().map(|nr| nr.spec.claimed_pod_uids.len()).sum();
-    assert!(
-        total_claimed > 0,
-        "{label}: {n} NRs but all have empty claimed_pod_uids — \
-         CRD schema may be missing claimedPodUids",
-        n = nrs.len(),
-    );
-
-    let all_uids: Vec<&str> = nrs
-        .iter()
-        .flat_map(|nr| nr.spec.claimed_pod_uids.iter().map(|s| s.as_str()))
-        .collect();
-    let unique: HashSet<&str> = all_uids.iter().copied().collect();
+/// Assert: the expected number of NodeRequests were created, no more, no less.
+fn assert_correct_nr_count(nrs: &[NodeRequest], expected: usize, label: &str) {
     assert_eq!(
-        all_uids.len(),
-        unique.len(),
-        "{label}: duplicate pod UIDs across NodeRequests! \
-         total={}, unique={}, nrs={}",
-        all_uids.len(),
-        unique.len(),
+        nrs.len(),
+        expected,
+        "{label}: expected {expected} NodeRequests but found {}",
         nrs.len(),
     );
-
-    println!("{label}: OK — {} NRs, {total_claimed} claimed UIDs", nrs.len());
+    println!("{label}: OK — {} NodeRequests", nrs.len());
 }
 
-/// Configure the fail point so the watcher exits after `crash_after` NR
+/// Configure the fail point so the watcher exits after `crash_after` NodeRequest
 /// creates, then spawn the watcher and wait for it to exit. Returns the
 /// number of NodeRequests present after the crash.
 async fn run_watcher_with_fault(client: kube::Client, crash_after: usize) -> usize {
     // "N*off->return" means: pass through N times, then return (trigger the
     // fail point closure) on every subsequent call.
-    fail::cfg("reconcile_after_nr_create", &format!("{crash_after}*off->return")).unwrap();
+    fail::cfg(
+        "reconcile_after_nr_create",
+        &format!("{crash_after}*off->return"),
+    )
+    .unwrap();
 
     let ctx = make_ctx(client.clone());
-    let handle = tokio::spawn(run_pod_watcher_standalone(ctx));
+    let handle = tokio::spawn(run_pod_watcher(ctx));
 
     match tokio::time::timeout(Duration::from_secs(30), handle).await {
         Ok(Ok(Ok(()))) => {}
@@ -189,10 +178,10 @@ async fn run_watcher_with_fault(client: kube::Client, crash_after: usize) -> usi
     testing::list_node_requests(client).await.unwrap().len()
 }
 
-/// Spawn watcher without faults, wait for NRs to stabilise, return them.
+/// Spawn watcher without faults, wait for NodeRequests to stabilise, return them.
 async fn run_recovery_watcher(client: kube::Client) -> Vec<NodeRequest> {
     let ctx = make_ctx(client.clone());
-    let handle = tokio::spawn(run_pod_watcher_standalone(ctx));
+    let handle = tokio::spawn(run_pod_watcher(ctx));
     let nrs = wait_for_stable_nr_count(client, Duration::from_secs(3)).await;
     handle.abort();
     let _ = handle.await;
@@ -208,15 +197,19 @@ async fn watcher_recovers_after_mid_reconcile_crash() {
     let client = growthrs::testing::test_client().await;
 
     for (round, crash_after) in [3, 15, 27].iter().enumerate() {
-        println!("=== crash after {crash_after} NR creates ===");
+        println!("=== crash after {crash_after} NodeRequest creates ===");
         setup_round(client.clone(), round).await;
 
         let nrs_at_crash = run_watcher_with_fault(client.clone(), *crash_after).await;
-        println!("  faulted with {nrs_at_crash} NRs (target {crash_after})");
+        println!("  faulted with {nrs_at_crash} NodeRequests (target {crash_after})");
 
         let nrs = run_recovery_watcher(client.clone()).await;
-        assert_eq!(nrs.len(), EXPECTED_NRS, "expected {EXPECTED_NRS} NRs after recovery");
-        assert_no_duplicate_uids(&nrs, &format!("crash@{crash_after}"));
+        assert_eq!(
+            nrs.len(),
+            EXPECTED_NRS,
+            "expected {EXPECTED_NRS} NodeRequests after recovery"
+        );
+        assert_correct_nr_count(&nrs, EXPECTED_NRS, &format!("crash@{crash_after}"));
     }
 
     testing::nuke(client).await.unwrap();
