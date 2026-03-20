@@ -293,15 +293,14 @@ mod tests {
 
     #[test]
     fn reserved_name_collision_is_validated_at_resolve_time() {
-        use crate::crds::hetzner_node_class::RESERVED_DYNAMIC_VARS;
+        use crate::crds::user_data::RESERVED_DYNAMIC_VARS;
 
         assert!(RESERVED_DYNAMIC_VARS.contains(&"REGION"));
         assert!(RESERVED_DYNAMIC_VARS.contains(&"LOCATION"));
         assert!(RESERVED_DYNAMIC_VARS.contains(&"INSTANCE_TYPE"));
         assert!(RESERVED_DYNAMIC_VARS.contains(&"NODE_LABELS"));
 
-        // Verify the error type exists and formats correctly.
-        let err = crate::crds::hetzner_node_class::UserDataError::ReservedNameCollision {
+        let err = crate::crds::user_data::UserDataError::ReservedNameCollision {
             name: "REGION".into(),
         };
         assert!(err.to_string().contains("REGION"));

@@ -102,21 +102,14 @@ async fn get_unschedulable_pods(client: Client) -> Result<Vec<Pod>, ControllerEr
 async fn get_node_pools(client: Client) -> Result<Vec<PoolConfig>, ControllerError> {
     let api: Api<NodePool> = Api::all(client);
     let lp = ListParams::default();
-    api.list(&lp)
+    Ok(api
+        .list(&lp)
         .await?
         .into_iter()
-        .map(|np| {
-            let name = np
-                .metadata
-                .name
-                .ok_or(ControllerError::MissingName("NodePool"))?;
-            let uid = np
-                .metadata
-                .uid
-                .ok_or(ControllerError::Other(anyhow::anyhow!(
-                    "NodePool missing UID"
-                )))?;
-            Ok(PoolConfig {
+        .filter_map(|np| {
+            let name = np.metadata.name?;
+            let uid = np.metadata.uid?;
+            Some(PoolConfig {
                 name,
                 uid,
                 server_types: np.spec.server_types,
@@ -124,7 +117,7 @@ async fn get_node_pools(client: Client) -> Result<Vec<PoolConfig>, ControllerErr
                 locations: np.spec.locations,
             })
         })
-        .collect::<Result<Vec<PoolConfig>, ControllerError>>()
+        .collect())
 }
 
 /// Result of scanning NodeRequests for in-flight state.

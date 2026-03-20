@@ -4,7 +4,8 @@ pub(crate) mod node;
 pub(crate) mod node_removal;
 pub(crate) mod node_requests;
 pub mod pods;
-pub use errors::{ControllerError, PodPoolError};
+pub use errors::ControllerError;
+pub use pods::PodPoolError;
 use helpers::wait_for_crds;
 pub(crate) use helpers::{is_kube_not_found, update_node_request_phase};
 
