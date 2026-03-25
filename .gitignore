@@ -3,3 +3,6 @@ growthrs/.claude/
 growthrs/Cargo.lock
 .claude/settings.local.json
 .claude/**/*
+.zed/settings.json
+TODO.md
+deploy/chart/values-production.yaml
