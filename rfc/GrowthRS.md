@@ -126,10 +126,10 @@ status:
   3. If pod doesn't request a `NodePool`, and no `default` exists, create error event.
   4. If pod requests a `NodePool`, and it doesn't exist, create error event.
 3. Retrieve all `NodeRequest`s and build in-flight state:
-  1. Collect claimed pod UIDs from all non-`Unmet` NRs (Pending, Provisioning, Ready, Deprovisioning). Pods with these UIDs are excluded from demand so we never double-provision.
-  2. Count Pending/Provisioning NRs per pool per instance type. Combined with actual node counts (from `managed-by=growth` labelled nodes), these form the "occupied slots" used to enforce `max` limits.
-  3. `Unmet` NRs release their claimed pod UIDs back to the demand pool — the solver will attempt to place them on alternative offerings.
-4. An in-memory `PendingClaims` cache bridges API lag: pod UIDs are recorded immediately after NR creation and drained once the API list reflects them. This prevents duplicate NRs across back-to-back reconciliation loops.
+  1. Collect claimed pod UIDs from all non-`Unmet` NodeRequests (Pending, Provisioning, Ready, Deprovisioning). Pods with these UIDs are excluded from demand so we never double-provision.
+  2. Count Pending/Provisioning NodeRequests per pool per instance type. Combined with actual node counts (from `managed-by=growth` labelled nodes), these form the "occupied slots" used to enforce `max` limits.
+  3. `Unmet` NodeRequests release their claimed pod UIDs back to the demand pool — the solver will attempt to place them on alternative offerings.
+4. An in-memory `PendingClaims` cache bridges API lag: pod UIDs are recorded immediately after NodeRequest creation and drained once the API list reflects them. This prevents duplicate NodeRequests across back-to-back reconciliation loops.
 5. Provide the Solver with unclaimed `Demand`s, `Offering`s, and occupied counts.
 6. The Solver provides a PlacementSolution.
   1. If the PlacementSolution is `AllPlaced`, create a `NodeRequest` for each potential node.
@@ -148,10 +148,10 @@ We can't easily track this in state. Fallbacks require replanning with the solve
   3. If provider doesn't have capacity, update the state to `Unmet`. Pods linked to this demand will get new nodes provisioned on the next loop.
 2. For each `NodeRequest` in state `Provisioning`
   1. Check prospective Node status via the provider. If provider reports `Failed` or `NotFound`, update to `Unmet`.
-  2. If, after a known `provisioning_timeout`, the Node does not become `Ready`, create a `NodeRemovalRequest` in `Deprovisioning` phase for the orphan node (delegating cleanup to the NRR reconciler) and update the NR to `Unmet`. If NRR creation fails, stay in `Provisioning` and requeue for retry.
+  2. If, after a known `provisioning_timeout`, the Node does not become `Ready`, create a `NodeRemovalRequest` in `Deprovisioning` phase for the orphan node (delegating cleanup to the NRR reconciler) and update the NodeRequest to `Unmet`. If NRR creation fails, stay in `Provisioning` and requeue for retry.
 3. For each `NodeRequest` in state `Ready`, await further changes. (Planned: TTL-based cleanup.)
 4. For each `NodeRequest` in state `Unmet`, await further changes. (Planned: TTL-based cleanup to release the slot.)
-5. `Deprovisioning` is a legacy phase. Any NR found in this state is deleted immediately. Node cleanup is now handled exclusively via `NodeRemovalRequest`.
+5. `Deprovisioning` is a legacy phase. Any NodeRequest found in this state is deleted immediately. Node cleanup is now handled exclusively via `NodeRemovalRequest`.
 
 --- Now, let's handle Node Removal and ScaleDown.
 A periodic idle-node scanner runs alongside the per-object NRR reconciler.

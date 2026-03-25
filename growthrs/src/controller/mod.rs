@@ -1,13 +1,20 @@
 pub mod errors;
+pub mod healthcheck;
 pub(crate) mod helpers;
+#[cfg(not(feature = "testing"))]
 pub(crate) mod node;
+#[cfg(feature = "testing")]
+pub mod node;
+#[cfg(not(feature = "testing"))]
 pub(crate) mod node_removal;
+#[cfg(feature = "testing")]
+pub mod node_removal;
 pub(crate) mod node_requests;
 pub mod pods;
 pub use errors::ControllerError;
-pub use pods::PodPoolError;
 use helpers::wait_for_crds;
 pub(crate) use helpers::{is_kube_not_found, update_node_request_phase};
+pub use pods::PodPoolError;
 
 use std::sync::Arc;
 
@@ -21,8 +28,8 @@ use crate::controller::node_requests::run_node_request_controller;
 // Re-export for external consumers (integration tests, main.rs).
 pub use pods::watcher::run_pod_watcher;
 pub use pods::{
-    ClusterState, InFlightCapacity, NodeRequestDemand, PoolConfig, ReconcileResult,
-    init_recent_creates, reconcile_pods, reconcile_unschedulable_pods, subtract_in_flight,
+    ClusterState, NodeRequestDemand, PoolConfig, ReconcileResult, init_unconfirmed_creates,
+    reconcile_pod_demand, reconcile_unschedulable_pods,
 };
 
 /// Run the event-driven controllers + watchers.

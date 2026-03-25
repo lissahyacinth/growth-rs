@@ -1,3 +1,17 @@
+//! Create Test Resources for a Cluster
+//!
+//! Usage: cargo run --bin test_pod --features="testing"
+//!
+//! Create a Test Pool;
+//! cargo run --bin test_pod --features="testing" create-pool <name> <type:max> [<type:min:max> ...]
+//!
+//! KWOK is pegged to Hetzner - so we can still use Hetzner server types
+//! i.e. `cargo run --bin test_pod --features="testing" create-pool test-pool cpx22:5`
+//!
+//! Create a Test Pod;
+//! cargo run --bin test_pod --features="testing" create <name> <cpu> <memory> [--gpu <n>] [--pool <pool>]
+//!
+//! i.e. `cargo run --bin test_pod --features="testing" create test-pod 1 1024 --gpu 1 --pool test-pool`
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -5,7 +19,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::DeleteParams;
 use kube::{Api, Client};
 
-use growthrs::crds::node_pool::{NodePool, ServerTypeConfig};
+use growthrs::resources::node_pool::{NodePool, ServerTypeConfig};
 use growthrs::testing;
 
 async fn delete_test_pod(client: Client, name: &str) -> Result<()> {
@@ -39,7 +53,7 @@ fn usage() -> ! {
     eprintln!("  test_pod create-many 20 1 512Mi --pool default");
     eprintln!("  test_pod create-many 32 1 4096Mi --pool cpu-workers --prefix worker");
     eprintln!("  test_pod delete my-pod");
-    eprintln!("  test_pod create-pool default cx22:10 cpx31:5");
+    eprintln!("  test_pod create-pool default cpx22:10 cpx31:5");
     eprintln!("  test_pod create-pool gpu-workers gpu-a100:0:3");
     eprintln!("  test_pod delete-pool default");
     eprintln!("  test_pod nuke                          # delete all growth resources");
@@ -49,7 +63,7 @@ fn usage() -> ! {
 fn find_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter().position(|a| a == flag).map(|i| {
         args.get(i + 1)
-            .expect(&format!("{flag} requires a value"))
+            .unwrap_or_else(|| panic!("{flag} requires a value"))
             .as_str()
     })
 }

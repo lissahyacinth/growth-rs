@@ -1,4 +1,4 @@
-mod helpers;
+pub(crate) mod helpers;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,24 +9,18 @@ use kube::runtime::controller::Action;
 use kube::runtime::{Controller, watcher};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::config::ControllerContext;
+use crate::controller::node_removal::helpers::create_node_removal_request;
 use crate::controller::node_requests::helpers::delete_node_request;
-use crate::crds::node_removal_request::{NodeRemovalRequestPhase, create_node_removal_request};
-use crate::crds::node_request::{NodeRequest, NodeRequestPhase};
+use crate::controller::{ControllerError, is_kube_not_found, update_node_request_phase};
 use crate::providers::provider::{NodeId, ProviderStatus};
+use crate::resources::node_removal_request::NodeRemovalRequestPhase;
+use crate::resources::node_request::{NodeRequest, NodeRequestPhase};
 
-use super::{ControllerContext, ControllerError, is_kube_not_found, update_node_request_phase};
-
-use helpers::attempt_provision;
+use helpers::{ProvisionOutcome, attempt_provision};
 
 const PROVISIONING_REQUEUE: Duration = Duration::from_secs(60);
 const NR_ERROR_REQUEUE: Duration = Duration::from_secs(5);
-
-#[derive(Debug)]
-pub enum ProvisionOutcome {
-    Created,
-    NoMatchingOffering,
-    OfferingUnavailable,
-}
 
 /// Run the per-object NodeRequest controller.
 pub(crate) async fn run_node_request_controller(
@@ -109,7 +103,9 @@ async fn decide_phase(
         NodeRequestPhase::Provisioning => {
             let now = ctx.clock.now();
             match ctx.provider.status(&NodeId(nr.spec.node_id.clone())).await {
-                Ok(ProviderStatus::Failed { .. }) | Ok(ProviderStatus::NotFound) => {
+                Ok(ProviderStatus::Failed { .. })
+                | Ok(ProviderStatus::Removing)
+                | Ok(ProviderStatus::NotFound) => {
                     Ok((Some(NodeRequestPhase::Unmet), Action::await_change()))
                 }
                 Ok(ProviderStatus::Creating) | Ok(ProviderStatus::Running) => {
@@ -121,7 +117,7 @@ async fn decide_phase(
                             &nr.spec.node_id,
                             None,
                             &pool,
-                            &nr.spec.target_offering,
+                            &nr.spec.target_offering.0,
                             NodeRemovalRequestPhase::Deprovisioning,
                             now,
                         )
@@ -252,12 +248,13 @@ mod tests {
 
     use crate::clock::SystemClock;
     use crate::config::ScaleDownConfig;
-    use crate::crds::node_request::{
-        NodeRequest, NodeRequestPhase, NodeRequestSpec, NodeRequestStatus,
-    };
     use crate::offering::Resources;
+    use crate::offering::{InstanceType, Region};
     use crate::providers::fake::{FakeProvider, StatusBehavior};
     use crate::providers::provider::{Provider, ProviderStatus};
+    use crate::resources::node_request::{
+        NodeRequest, NodeRequestPhase, NodeRequestSpec, NodeRequestStatus,
+    };
 
     use super::*;
 
@@ -289,8 +286,8 @@ mod tests {
             },
             spec: NodeRequestSpec {
                 node_id: node_id.into(),
-                target_offering: "cpx22".into(),
-                location: "eu-central".into(),
+                target_offering: InstanceType("cpx22".into()),
+                location: Region("eu-central".into()),
                 resources: Resources {
                     cpu: 2,
                     memory_mib: 4096,
@@ -313,7 +310,7 @@ mod tests {
             provider: Provider::Fake(provider),
             provisioning_timeout: Duration::from_secs(300),
             scale_down: ScaleDownConfig::default(),
-            clock: Box::new(SystemClock),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -366,10 +363,10 @@ mod tests {
     }
 
     /// When the kube API returns a 500 for the NodePool GET (e.g. network
-    /// blip), `attempt_provision` should still succeed — provisioning the
-    /// node with empty labels rather than crashing or returning an error.
+    /// blip), `attempt_provision` propagates the error so the controller
+    /// can requeue and retry rather than silently provisioning with no config.
     #[tokio::test]
-    async fn provision_succeeds_with_empty_labels_on_pool_fetch_error() {
+    async fn provision_returns_error_on_pool_fetch_failure() {
         use crate::offering::{InstanceType, Location, Offering, Region, Zone};
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
@@ -402,7 +399,7 @@ mod tests {
             provider: Provider::Fake(provider),
             provisioning_timeout: Duration::from_secs(300),
             scale_down: ScaleDownConfig::default(),
-            clock: Box::new(SystemClock),
+            clock: Arc::new(SystemClock),
         };
 
         let nr = NodeRequest {
@@ -419,8 +416,8 @@ mod tests {
             },
             spec: NodeRequestSpec {
                 node_id: "growth-test-node".into(),
-                target_offering: "cpx22".into(),
-                location: "eu-central".into(),
+                target_offering: InstanceType("cpx22".into()),
+                location: Region("eu-central".into()),
                 resources: Resources {
                     cpu: 2,
                     memory_mib: 4096,
@@ -452,8 +449,8 @@ mod tests {
 
         let result = helpers::attempt_provision(&nr, &ctx).await;
         assert!(
-            matches!(result, Ok(ProvisionOutcome::Created)),
-            "expected Created despite pool label fetch failure, got {result:?}"
+            result.is_err(),
+            "expected error on pool fetch failure, got {result:?}"
         );
     }
 }

@@ -2,22 +2,35 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tracing::{debug, warn};
 
-use crate::controller::errors::PodPoolError;
-use crate::crds::node_pool::{LocationConstraint, ServerTypeConfig};
-use crate::offering::{Offering, PodId, PodResources, Resources};
-use crate::optimiser::{BoundedOffering, PlacementSolution, SolveError, solve};
+use crate::offering::{Offering, PodResources};
+use crate::optimiser::{BoundedOffering, ExistingNode, PlacementSolution, solve};
+use crate::resources::node_pool::{LocationConstraint, ServerTypeConfig};
 
-/// In-flight NodeRequest capacity used for resource-based deduplication.
-///
-/// Each entry represents a Pending, Provisioning, or young-Unmet NodeRequest.
-/// `subtract_in_flight` absorbs pods into this capacity so the solver only
-/// sees residual demand.
-#[derive(Debug, Clone)]
-pub struct InFlightCapacity {
-    /// Pool this NodeRequest belongs to.
-    pub pool: String,
-    /// Snapshot of the resources this NodeRequest provides.
-    pub resources: Resources,
+/// Why a pod could not be assigned to any pool.
+#[derive(Debug)]
+pub enum PodPoolReason {
+    /// Pod selected a pool that does not exist.
+    PoolNotFound { requested: String },
+    /// Pod has no pool selector and no "default" pool exists.
+    NoPoolSelector,
+}
+
+impl std::fmt::Display for PodPoolReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PoolNotFound { requested } => write!(f, "pool {requested:?} not found"),
+            Self::NoPoolSelector => {
+                write!(f, "no pool selector and no \"default\" pool exists")
+            }
+        }
+    }
+}
+
+/// A pod that could not be assigned to any pool.
+#[derive(Debug)]
+pub struct PodPoolError {
+    pub pod_id: crate::offering::PodId,
+    pub reason: PodPoolReason,
 }
 
 #[derive(Debug)]
@@ -26,8 +39,6 @@ pub struct NodeRequestDemand {
     pub pool: String,
     pub pool_uid: String,
     pub target_offering: Offering,
-    /// Labels from the owning NodePool, to be applied to the provisioned node.
-    pub labels: BTreeMap<String, String>,
 }
 
 /// Configuration for a single pool, derived from a NodePool CRD.
@@ -49,8 +60,9 @@ pub struct ReconcileResult {
     pub pod_errors: Vec<PodPoolError>,
 }
 
+/// Current state of Cluster demands and offerings.
 pub struct ClusterState {
-    /// Current demands within this reconcilliation decision
+    /// All unschedulable pod demands (full list, not residual).
     pub demands: Vec<PodResources>,
     /// Offerings from the Provider - what we can use to fulfil demands
     pub offerings: Vec<Offering>,
@@ -59,6 +71,10 @@ pub struct ClusterState {
     pub occupied_counts: HashMap<String, HashMap<String, u32>>,
     /// Available pools generated from NodePool CRDs.
     pub pools: Vec<PoolConfig>,
+    /// In-flight nodes per pool. The solver treats these as pre-seeded
+    /// capacity: pods are placed on them first (zero marginal cost),
+    /// and they are excluded from the output.
+    pub in_flight_nodes: HashMap<String, Vec<ExistingNode>>,
 }
 
 /// Assign pod demands to offered pools based on their `pool` selector.
@@ -86,7 +102,9 @@ pub fn assign_pods_to_pools(
                 } else {
                     errors.push(PodPoolError {
                         pod_id: pod.id.clone(),
-                        reason: format!("pool {name:?} not found"),
+                        reason: PodPoolReason::PoolNotFound {
+                            requested: name.clone(),
+                        },
                     });
                 }
             }
@@ -99,7 +117,7 @@ pub fn assign_pods_to_pools(
                 } else {
                     errors.push(PodPoolError {
                         pod_id: pod.id.clone(),
-                        reason: "no pool selector and no \"default\" pool exists".to_string(),
+                        reason: PodPoolReason::NoPoolSelector,
                     });
                 }
             }
@@ -124,52 +142,151 @@ pub fn filter_offerings_for_pool(offerings: &[Offering], pool: &PoolConfig) -> V
         .collect()
 }
 
-/// Subtract in-flight NodeRequest capacity from pod demand.
-///
-/// For each in-flight NodeRequest, greedily absorbs pods (largest-first)
-/// whose pool matches and whose resources fit. Returns the residual pods
-/// that still need new NodeRequests.
-///
-/// Imprecision is expected: the simulation may absorb different pods than
-/// Kubernetes actually schedules. The convergence model handles this —
-/// idle removal cleans up over-provisioning, the next loop catches
-/// under-provisioning.
-pub fn subtract_in_flight(
-    mut pods: Vec<PodResources>,
-    in_flight: &[InFlightCapacity],
-) -> Vec<PodResources> {
-    if in_flight.is_empty() {
-        return pods;
-    }
-
-    // Sort largest-first (by cpu descending, then memory descending) for greedy packing.
-    pods.sort_by(|a, b| {
-        b.resources
-            .cpu
-            .cmp(&a.resources.cpu)
-            .then(b.resources.memory_mib.cmp(&a.resources.memory_mib))
-    });
-
-    for cap in in_flight {
-        let mut remaining = cap.resources.clone();
-        pods.retain(|pod| {
-            let pool_matches = pod
-                .pool
-                .as_deref()
-                .map_or(cap.pool == "default", |p| p == cap.pool);
-            if pool_matches && remaining.satisfies(&pod.resources) {
-                remaining.subtract(&pod.resources);
-                false // absorbed by in-flight capacity
-            } else {
-                true // still needs placement
-            }
-        });
-    }
-
-    pods
+/// Build pre-seeded existing nodes for a pool, enriched with pool labels.
+fn build_existing_nodes(
+    in_flight_nodes: &HashMap<String, Vec<ExistingNode>>,
+    pool_name: &str,
+    pool_labels: &BTreeMap<String, String>,
+) -> Vec<ExistingNode> {
+    in_flight_nodes
+        .get(pool_name)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|n| {
+                    let mut labels = pool_labels.clone();
+                    labels.extend(n.labels.clone());
+                    ExistingNode {
+                        resources: n.resources.clone(),
+                        labels,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError> {
+/// Build `BoundedOffering`s from pool offerings, filtering by demand satisfaction,
+/// location constraints, and remaining capacity per instance type.
+fn build_bounded_offerings(
+    pool_offerings: &[Offering],
+    pool_demands: &[PodResources],
+    pool: &PoolConfig,
+    max_by_type: &HashMap<&str, u32>,
+    pool_name: &str,
+) -> Vec<BoundedOffering> {
+    pool_offerings
+        .iter()
+        .filter(|o| pool_demands.iter().any(|d| o.satisfies(&d.resources)))
+        .filter(|o| {
+            // Filter by location constraints: offering must match at least one entry.
+            // No locations = all regions/zones allowed.
+            if let Some(locations) = &pool.locations {
+                locations.iter().any(|loc| {
+                    if loc.region != o.location.region.0 {
+                        return false;
+                    }
+                    match (&loc.zones, &o.location.zone) {
+                        (Some(zones), Some(z)) => zones.iter().any(|a| a == &z.0),
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    }
+                })
+            } else {
+                true
+            }
+        })
+        .map(|o| {
+            let remaining_max = max_by_type
+                .get(o.instance_type.0.as_str())
+                .copied()
+                .unwrap_or(0);
+
+            // Derive topology labels from offering location.
+            let mut labels = pool.labels.clone();
+            labels.insert(
+                "topology.kubernetes.io/region".into(),
+                o.location.region.0.clone(),
+            );
+            if let Some(ref z) = o.location.zone {
+                labels.insert("topology.kubernetes.io/zone".into(), z.0.clone());
+            }
+
+            BoundedOffering {
+                max_instances: remaining_max,
+                offering: o.clone(),
+                labels,
+                type_group: Some(format!("{}/{}", pool_name, o.instance_type.0)),
+            }
+        })
+        .collect()
+}
+
+/// Solve placement for a single pool: filter offerings, apply capacity limits,
+/// run the solver, and return the resulting node request demands.
+///
+/// Each Pool is separable as pods cannot be set to run on multiple pools.
+fn solve_pool(
+    pool_name: &str,
+    pool_demands: &[PodResources],
+    pool: &PoolConfig,
+    offerings: &[Offering],
+    occupied_counts: &HashMap<String, HashMap<String, u32>>,
+    in_flight_nodes: &HashMap<String, Vec<ExistingNode>>,
+) -> Vec<NodeRequestDemand> {
+    let pool_offerings = filter_offerings_for_pool(offerings, pool);
+
+    // Subtract occupied slots (existing nodes + pending/provisioning NodeRequests)
+    // from each type's max so the solver only provisions what the pool
+    // can still accept.
+    let occupied = occupied_counts.get(pool_name);
+
+    let max_by_type: HashMap<&str, u32> = pool
+        .server_types
+        .iter()
+        .map(|st| {
+            let occupied_count = occupied
+                .and_then(|m| m.get(st.name.as_str()))
+                .copied()
+                .unwrap_or(0);
+            let remaining = st.max.saturating_sub(occupied_count);
+            (st.name.as_str(), remaining)
+        })
+        .collect();
+
+    let suitable =
+        build_bounded_offerings(&pool_offerings, pool_demands, pool, &max_by_type, pool_name);
+
+    let existing = build_existing_nodes(in_flight_nodes, pool_name, &pool.labels);
+
+    let solution = solve(pool_demands, &suitable, &existing);
+
+    let (nodes, unmet) = match solution {
+        PlacementSolution::NoDemands => return vec![],
+        PlacementSolution::AllPlaced(nodes) => (nodes, vec![]),
+        PlacementSolution::IncompletePlacement { nodes, unmet } => (nodes, unmet),
+    };
+
+    if !unmet.is_empty() {
+        warn!(
+            pool = %pool_name,
+            unmet_count = unmet.len(),
+            "incomplete placement — some pods could not be scheduled"
+        );
+    }
+
+    nodes
+        .into_iter()
+        .map(|node| NodeRequestDemand {
+            pool: pool_name.to_string(),
+            pool_uid: pool.uid.clone(),
+            target_offering: node.offering,
+        })
+        .collect()
+}
+
+/// Reconcile pod demands against the cluster state, returning demands for nodes to fulfill them.
+pub fn reconcile_pod_demand(state: ClusterState) -> ReconcileResult {
     let (pods_by_pool, pod_errors) = assign_pods_to_pools(&state.demands, &state.pools);
 
     let pool_map: HashMap<&str, &PoolConfig> =
@@ -179,113 +296,25 @@ pub fn reconcile_pods(state: ClusterState) -> Result<ReconcileResult, SolveError
 
     for (pool_name, pool_demands) in &pods_by_pool {
         debug!(pool = %pool_name, pods = pool_demands.len(), "pool demand");
-        let pool = pool_map[pool_name.as_str()];
-
         if pool_demands.is_empty() {
             continue;
         }
 
-        let pool_offerings = filter_offerings_for_pool(&state.offerings, pool);
-
-        // Subtract occupied slots (existing nodes + pending/provisioning NodeRequests)
-        // from each type's max so the solver only provisions what the pool
-        // can still accept.
-        let occupied = state.occupied_counts.get(pool_name.as_str());
-
-        let max_by_type: HashMap<&str, u32> = pool
-            .server_types
-            .iter()
-            .map(|st| {
-                let occupied_count = occupied
-                    .and_then(|m| m.get(st.name.as_str()))
-                    .copied()
-                    .unwrap_or(0);
-                let remaining = st.max.saturating_sub(occupied_count);
-                (st.name.as_str(), remaining)
-            })
-            .collect();
-
-        let suitable: Vec<_> = pool_offerings
-            .iter()
-            .filter(|o| pool_demands.iter().any(|d| o.satisfies(&d.resources)))
-            .filter(|o| {
-                // Filter by location constraints: offering must match at least one entry.
-                // No locations = all regions/zones allowed.
-                if let Some(locations) = &pool.locations {
-                    locations.iter().any(|loc| {
-                        if loc.region != o.location.region.0 {
-                            return false;
-                        }
-                        match (&loc.zones, &o.location.zone) {
-                            (Some(zones), Some(z)) => zones.iter().any(|a| a == &z.0),
-                            (Some(_), None) => false,
-                            (None, _) => true,
-                        }
-                    })
-                } else {
-                    true
-                }
-            })
-            .map(|o| {
-                let remaining_max = max_by_type
-                    .get(o.instance_type.0.as_str())
-                    .copied()
-                    .unwrap_or(0);
-
-                // Derive topology labels from offering location.
-                let mut labels = pool.labels.clone();
-                labels.insert(
-                    "topology.kubernetes.io/region".into(),
-                    o.location.region.0.clone(),
-                );
-                if let Some(ref z) = o.location.zone {
-                    labels.insert("topology.kubernetes.io/zone".into(), z.0.clone());
-                }
-
-                BoundedOffering {
-                    max_instances: remaining_max,
-                    offering: o.clone(),
-                    labels,
-                    type_group: Some(format!("{}/{}", pool_name, o.instance_type.0)),
-                }
-            })
-            .collect();
-
-        let solution = solve(pool_demands, &suitable)?;
-
-        let (nodes, unmet) = match solution {
-            PlacementSolution::NoDemands => continue,
-            PlacementSolution::AllPlaced(nodes) => (nodes, vec![]),
-            PlacementSolution::IncompletePlacement { nodes, unmet } => (nodes, unmet),
-        };
-
-        if !unmet.is_empty() {
-            warn!(
-                pool = %pool_name,
-                unmet_count = unmet.len(),
-                "incomplete placement — some pods could not be scheduled"
-            );
-        }
-
-        let new_demands: Vec<_> = nodes
-            .into_iter()
-            .map(|node| {
-                NodeRequestDemand {
-                    pool: pool_name.clone(),
-                    pool_uid: pool.uid.clone(),
-                    target_offering: node.offering,
-                    labels: pool.labels.clone(),
-                }
-            })
-            .collect();
-
-        all_demands.extend(new_demands);
+        let pool = pool_map[pool_name.as_str()];
+        all_demands.extend(solve_pool(
+            pool_name,
+            pool_demands,
+            pool,
+            &state.offerings,
+            &state.occupied_counts,
+            &state.in_flight_nodes,
+        ));
     }
 
-    Ok(ReconcileResult {
+    ReconcileResult {
         demands: all_demands,
         pod_errors,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +399,7 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         }
     }
 
@@ -381,7 +411,7 @@ mod tests {
             vec![pod("a", 1, 1024)],
             vec![offering("cpx22", 2, 4096, 0.01)],
         );
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
     }
 
@@ -427,7 +457,9 @@ mod tests {
 
         assert!(assigned.is_empty());
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].reason.contains("nonexistent"));
+        assert!(
+            matches!(errors[0].reason, PodPoolReason::PoolNotFound { ref requested } if requested == "nonexistent")
+        );
     }
 
     #[test]
@@ -459,7 +491,7 @@ mod tests {
         let (_, errors) = assign_pods_to_pools(&demands, &pools);
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].reason.contains("default"));
+        assert!(matches!(errors[0].reason, PodPoolReason::NoPoolSelector));
     }
 
     // --- Offering filter tests ---
@@ -506,8 +538,9 @@ mod tests {
             offerings: vec![offering("cpx22", 2, 4096, 0.01)],
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
         assert_eq!(result.demands[0].pool, "workers");
         assert_eq!(result.demands[0].pool_uid, "workers-uid");
@@ -532,8 +565,9 @@ mod tests {
             offerings: vec![offering("cpx22", 2, 4096, 0.01)],
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert!(result.demands.is_empty());
         assert_eq!(result.pod_errors.len(), 1);
     }
@@ -561,8 +595,9 @@ mod tests {
                 HashMap::from([("cpx22".to_string(), 1)]),
             )]),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         // max=2, occupied=1 → solver may only provision 1 more node
         assert_eq!(result.demands.len(), 1);
     }
@@ -591,7 +626,7 @@ mod tests {
 
     #[test]
     fn location_region_only_filters_by_region() {
-        use crate::crds::node_pool::LocationConstraint;
+        use crate::resources::node_pool::LocationConstraint;
         let pool = PoolConfig {
             name: "default".to_string(),
             uid: "uid".to_string(),
@@ -616,8 +651,9 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
         // The selected offering must be in us-west
         assert!(
@@ -632,7 +668,7 @@ mod tests {
 
     #[test]
     fn location_region_plus_zones_filters_correctly() {
-        use crate::crds::node_pool::LocationConstraint;
+        use crate::resources::node_pool::LocationConstraint;
         let pool = PoolConfig {
             name: "default".to_string(),
             uid: "uid".to_string(),
@@ -657,8 +693,9 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
         let loc = &result.demands[0].target_offering.location;
         assert_eq!(loc.region.0, "us-west");
@@ -667,7 +704,7 @@ mod tests {
 
     #[test]
     fn multi_region_mixed_zone_constraints() {
-        use crate::crds::node_pool::LocationConstraint;
+        use crate::resources::node_pool::LocationConstraint;
         // us-west4: zones a,b; us-west2: zone a only
         let pool = PoolConfig {
             name: "default".to_string(),
@@ -702,8 +739,9 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         // All placed offerings must be in the allowed set
         for d in &result.demands {
             let loc = &d.target_offering.location;
@@ -742,14 +780,15 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
     }
 
     #[test]
     fn offering_without_zone_rejected_when_zones_specified() {
-        use crate::crds::node_pool::LocationConstraint;
+        use crate::resources::node_pool::LocationConstraint;
         let pool = PoolConfig {
             name: "default".to_string(),
             uid: "uid".to_string(),
@@ -771,8 +810,9 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert!(
             result.demands.is_empty(),
             "zone-less offering should be rejected when zones are specified"
@@ -781,7 +821,7 @@ mod tests {
 
     #[test]
     fn offering_without_zone_accepted_when_zones_omitted() {
-        use crate::crds::node_pool::LocationConstraint;
+        use crate::resources::node_pool::LocationConstraint;
         let pool = PoolConfig {
             name: "default".to_string(),
             uid: "uid".to_string(),
@@ -803,87 +843,90 @@ mod tests {
             offerings,
             occupied_counts: HashMap::new(),
             pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
         };
-        let result = reconcile_pods(state).unwrap();
+        let result = reconcile_pod_demand(state);
         assert_eq!(result.demands.len(), 1);
     }
 
-    // --- subtract_in_flight tests ---
-
-    fn in_flight(pool: &str, cpu: u32, memory_mib: u32) -> InFlightCapacity {
-        InFlightCapacity {
-            pool: pool.to_string(),
-            resources: res(cpu, memory_mib),
-        }
-    }
+    // --- In-flight pre-seeded tests ---
 
     #[test]
-    fn subtract_empty_in_flight_passes_all_pods() {
-        let pods = vec![pod("a", 1, 1024), pod("b", 2, 2048)];
-        let result = subtract_in_flight(pods, &[]);
-        assert_eq!(result.len(), 2);
-    }
+    fn in_flight_scoped_to_correct_pool() {
+        // T9: In-flight nodes for "gpu" pool must not absorb "cpu" pool demand.
+        use crate::optimiser::ExistingNode;
 
-    #[test]
-    fn subtract_exact_match_absorbs_all() {
-        let pods = vec![pod("a", 1, 1024), pod("b", 1, 1024)];
-        let cap = vec![in_flight("default", 2, 4096)];
-        let result = subtract_in_flight(pods, &cap);
-        assert!(result.is_empty(), "both pods should be absorbed");
-    }
-
-    #[test]
-    fn subtract_partial_coverage_leaves_residual() {
-        let pods = vec![pod("a", 1, 1024), pod("b", 1, 1024), pod("c", 1, 1024)];
-        let cap = vec![in_flight("default", 2, 4096)];
-        let result = subtract_in_flight(pods, &cap);
-        assert_eq!(result.len(), 1, "one pod should remain");
-    }
-
-    #[test]
-    fn subtract_pod_too_large_passes_through() {
-        let pods = vec![pod("big", 4, 8192)];
-        let cap = vec![in_flight("default", 2, 4096)];
-        let result = subtract_in_flight(pods, &cap);
-        assert_eq!(result.len(), 1, "oversized pod should not be absorbed");
-    }
-
-    #[test]
-    fn subtract_respects_pool_boundaries() {
-        let pods = vec![pod_with_pool("a", 1, 1024, "gpu")];
-        let cap = vec![in_flight("cpu", 4, 8192)];
-        let result = subtract_in_flight(pods, &cap);
-        assert_eq!(result.len(), 1, "wrong pool should not absorb");
-    }
-
-    #[test]
-    fn subtract_largest_first_packing() {
-        let pods = vec![pod("small", 1, 1024), pod("big", 2, 2048)];
-        let cap = vec![in_flight("default", 2, 4096)];
-        let result = subtract_in_flight(pods, &cap);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id.name, "small");
-    }
-
-    #[test]
-    fn subtract_gpu_demand_only_absorbed_by_gpu_capacity() {
-        use crate::offering::GpuModel;
-        let gpu_pod = PodResources {
-            id: PodId::new("default", "gpu-job"),
-            uid: "uid-gpu".into(),
-            resources: Resources {
-                cpu: 1,
-                memory_mib: 4096,
-                ephemeral_storage_gib: None,
-                gpu: 1,
-                gpu_model: Some(GpuModel::NvidiaT4),
-            },
-            pool: None,
-            pod_labels: BTreeMap::new(),
-            affinity_constraints: vec![],
+        let gpu_pool = PoolConfig {
+            name: "gpu".to_string(),
+            uid: "gpu-uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cpx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: None,
         };
-        let cap = vec![in_flight("default", 4, 16384)];
-        let result = subtract_in_flight(vec![gpu_pod], &cap);
-        assert_eq!(result.len(), 1, "GPU pod should not be absorbed by non-GPU capacity");
+        let cpu_pool = PoolConfig {
+            name: "cpu".to_string(),
+            uid: "cpu-uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "cpx22".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: None,
+        };
+
+        let state = ClusterState {
+            demands: vec![pod_with_pool("a", 1, 1024, "cpu")],
+            offerings: vec![offering("cpx22", 2, 4096, 0.01)],
+            occupied_counts: HashMap::new(),
+            pools: vec![gpu_pool, cpu_pool],
+            in_flight_nodes: HashMap::from([(
+                "gpu".to_string(),
+                vec![ExistingNode {
+                    resources: res(4, 8192),
+                    labels: BTreeMap::new(),
+                }],
+            )]),
+        };
+        let result = reconcile_pod_demand(state);
+        assert_eq!(
+            result.demands.len(),
+            1,
+            "gpu pool's in-flight should not absorb cpu pool demand"
+        );
+    }
+
+    #[test]
+    fn no_matching_offerings_produces_zero_demands() {
+        // Pool references "nonexistent" server type, but only "cpx22" offerings exist.
+        // Solver should gracefully produce zero demands, not panic.
+        let pool = PoolConfig {
+            name: "default".to_string(),
+            uid: "uid".to_string(),
+            server_types: vec![ServerTypeConfig {
+                name: "nonexistent".to_string(),
+                max: 100,
+                min: 0,
+            }],
+            labels: BTreeMap::new(),
+            locations: None,
+        };
+        let state = ClusterState {
+            demands: vec![pod("a", 1, 1024)],
+            offerings: vec![offering("cpx22", 2, 4096, 0.01)],
+            occupied_counts: HashMap::new(),
+            pools: vec![pool],
+            in_flight_nodes: HashMap::new(),
+        };
+        let result = reconcile_pod_demand(state);
+        assert!(
+            result.demands.is_empty(),
+            "mismatched server types should produce no demands"
+        );
+        assert!(result.pod_errors.is_empty());
     }
 }

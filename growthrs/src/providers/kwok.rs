@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{Node, NodeStatus};
+use k8s_openapi::api::core::v1::{Node, NodeSpec, NodeStatus, Taint};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::{Api, Client};
 use tracing::{debug, info};
 
-use crate::offering::{GpuModel, InstanceType, Location, Offering, Region, Resources, Zone};
+use crate::offering::{
+    GpuModel, InstanceType, Location, MANAGED_BY_LABEL, MANAGED_BY_VALUE, Offering, Region,
+    Resources, STARTUP_TAINT_KEY, Zone,
+};
 use crate::providers::provider::{InstanceConfig, NodeId, ProviderError, ProviderStatus};
 
 /// Hetzner-like zone names used by the KWOK provider for testing.
@@ -40,23 +43,13 @@ fn offering(
 
 fn gpu_offering(
     name: &str,
-    cpu: u32,
-    memory_mib: u32,
-    disk_gib: u32,
-    gpu: u32,
-    gpu_model: GpuModel,
+    resources: Resources,
     cost_per_hour: f64,
     location: Location,
 ) -> Offering {
     Offering {
         instance_type: InstanceType(name.into()),
-        resources: Resources {
-            cpu,
-            memory_mib,
-            ephemeral_storage_gib: Some(disk_gib),
-            gpu,
-            gpu_model: Some(gpu_model),
-        },
+        resources,
         cost_per_hour,
         location,
     }
@@ -92,7 +85,7 @@ impl KwokProvider {
         /// (name, cpu, mem_mib, disk_gib, cost/hr)
         const CPU_TYPES: &[(&str, u32, u32, u32, f64)] = &[
             // CX – Shared x86
-            ("cx22", 2, 4_096, 40, 0.0066),
+            ("cpx22", 2, 4_096, 40, 0.0066),
             ("cx32", 4, 8_192, 80, 0.0106),
             ("cx42", 8, 16_384, 160, 0.0170),
             ("cx52", 16, 32_768, 320, 0.0314),
@@ -135,11 +128,13 @@ impl KwokProvider {
             for &(name, cpu, mem, disk, gpu, cost) in GPU_TYPES {
                 offerings.push(gpu_offering(
                     name,
-                    cpu,
-                    mem,
-                    disk,
-                    gpu,
-                    GpuModel::NvidiaA100,
+                    Resources {
+                        cpu,
+                        memory_mib: mem,
+                        ephemeral_storage_gib: Some(disk),
+                        gpu,
+                        gpu_model: Some(GpuModel::NvidiaA100),
+                    },
                     cost,
                     loc.clone(),
                 ));
@@ -167,7 +162,7 @@ impl KwokProvider {
 
         let mut labels = BTreeMap::from([
             ("type".into(), "kwok".into()),
-            ("app.kubernetes.io/managed-by".into(), "growth".into()),
+            (MANAGED_BY_LABEL.into(), MANAGED_BY_VALUE.into()),
         ]);
         labels.extend(config.labels.clone());
 
@@ -187,7 +182,15 @@ impl KwokProvider {
                 allocatable: Some(allocatable),
                 ..Default::default()
             }),
-            spec: None,
+            spec: Some(NodeSpec {
+                taints: Some(vec![Taint {
+                    key: STARTUP_TAINT_KEY.into(),
+                    value: None,
+                    effect: "NoExecute".into(),
+                    time_added: None,
+                }]),
+                ..Default::default()
+            }),
         };
         let created = nodes
             .create(&PostParams::default(), &node)

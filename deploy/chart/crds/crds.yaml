@@ -1,0 +1,463 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: noderequests.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  names:
+    categories: []
+    kind: NodeRequest
+    plural: noderequests
+    shortNames:
+      - nr
+    singular: noderequest
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .spec.targetOffering
+          name: Offering
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for NodeRequestSpec via `CustomResource`
+          properties:
+            spec:
+              description: |-
+                Spec for a NodeRequest — a request to provision a single node.
+
+                NodeRequests track individual node provisioning through a state machine:
+                Pending → Provisioning → Ready | Unmet | Deprovisioning
+
+                They are owned by a NodePool and cleaned up via TTL once Ready or Unmet.
+              properties:
+                location:
+                  description: Provider location/region to provision in, e.g. "nbg1".
+                  type: string
+                nodeID:
+                  description: The pre-determined name for this upcoming node.
+                  type: string
+                resources:
+                  description: Snapshot of the resources this offering provides, captured at creation time.
+                  properties:
+                    cpu:
+                      description: vCPU count.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    ephemeralStorageGib:
+                      description: |-
+                        Included ephemeral storage in GiB. None if not applicable (e.g. Hetzner
+                        bundles it into server_type but it's not separately configurable).
+                      format: uint32
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    gpu:
+                      description: GPU count. 0 for non-GPU instances.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    gpuModel:
+                      description: GPU model identifier when gpu > 0.
+                      nullable: true
+                      type: string
+                    memoryMib:
+                      description: |-
+                        Memory in MiB. MiB not GiB — avoids the 0.5GiB rounding problem
+                        (e.g. t3.nano = 512 MiB, not 0.5 GiB).
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                  required:
+                    - cpu
+                    - gpu
+                    - memoryMib
+                  type: object
+                targetOffering:
+                  description: The offering (instance type) to provision, e.g. "hetzner-cax11".
+                  type: string
+              required:
+                - location
+                - nodeID
+                - resources
+                - targetOffering
+              type: object
+            status:
+              description: Status of a NodeRequest.
+              nullable: true
+              properties:
+                events:
+                  default: []
+                  description: Event log.
+                  items:
+                    description: A recorded event on a NodeRequest.
+                    properties:
+                      at:
+                        description: Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.
+                        format: date-time
+                        type: string
+                      name:
+                        type: string
+                      reason:
+                        nullable: true
+                        type: string
+                    required:
+                      - at
+                      - name
+                    type: object
+                  type: array
+                lastTransitionTime:
+                  description: Timestamp of the most recent phase transition.
+                  format: date-time
+                  nullable: true
+                  type: string
+                phase:
+                  default: Pending
+                  description: Current phase of the NodeRequest.
+                  enum:
+                    - Pending
+                    - Provisioning
+                    - Ready
+                    - Unmet
+                  type: string
+              type: object
+          required:
+            - spec
+          title: NodeRequest
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodepools.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  names:
+    categories: []
+    kind: NodePool
+    plural: nodepools
+    shortNames:
+      - np
+    singular: nodepool
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns: []
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for NodePoolSpec via `CustomResource`
+          properties:
+            spec:
+              description: |-
+                Spec for a NodePool — declares which server types are available for scaling.
+
+                Each NodePool lists one or more server types that the autoscaler may provision.
+                Pods are matched to pools via the `growth.vettrdev.com/pool` nodeSelector label.
+              properties:
+                labels:
+                  additionalProperties:
+                    type: string
+                  default: {}
+                  description: |-
+                    Labels applied to every node provisioned from this pool.
+                    Commonly used for topology labels (e.g. `topology.kubernetes.io/zone`).
+                  type: object
+                locations:
+                  description: |-
+                    If set, only offerings matching at least one entry are eligible.
+                    Each entry scopes allowed zones to a specific region.
+                    `None` means all regions and zones.
+                  items:
+                    description: |-
+                      A region with optional zone restrictions.
+
+                      An offering matches if its region equals `region` AND either `zones` is
+                      `None` (all zones in that region) or the offering's zone is in the list.
+                    properties:
+                      region:
+                        type: string
+                      zones:
+                        description: If `None`, all zones in this region are allowed.
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                    required:
+                      - region
+                    type: object
+                  nullable: true
+                  type: array
+                nodeClassRef:
+                  description: Optional reference to a provider-specific NodeClass for instance config.
+                  nullable: true
+                  properties:
+                    group:
+                      default: growth.vettrdev.com
+                      description: API group of the NodeClass resource.
+                      type: string
+                    kind:
+                      default: HetznerNodeClass
+                      description: Kind of the NodeClass resource.
+                      type: string
+                    name:
+                      description: Name of the NodeClass resource.
+                      type: string
+                  required:
+                    - name
+                  type: object
+                serverTypes:
+                  description: Server types available in this pool, each with scaling limits.
+                  items:
+                    description: Configuration for a single server type within a NodePool.
+                    properties:
+                      max:
+                        description: Maximum number of nodes of this type the pool may provision.
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      min:
+                        default: 0
+                        description: Minimum number of nodes to keep warm. Enforcement is a follow-up.
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      name:
+                        description: Must match an Offering's instance_type (e.g. "hetzner-cax11").
+                        type: string
+                    required:
+                      - max
+                      - name
+                    type: object
+                  type: array
+              required:
+                - serverTypes
+              type: object
+          required:
+            - spec
+          title: NodePool
+          type: object
+      served: true
+      storage: true
+      subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: noderemovalrequests.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  names:
+    categories: []
+    kind: NodeRemovalRequest
+    plural: noderemovalrequests
+    shortNames:
+      - nrr
+    singular: noderemovalrequest
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .spec.nodeName
+          name: Node
+          type: string
+        - jsonPath: .status.removalAttempts
+          name: Attempts
+          type: integer
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for NodeRemovalRequestSpec via `CustomResource`
+          properties:
+            spec:
+              description: |-
+                Spec for a NodeRemovalRequest — a request to remove a single node.
+
+                NodeRemovalRequests track individual node removal through a state machine:
+                Pending → Deprovisioning | CouldNotRemove
+
+                They are owned by the Node being removed (when one exists) and cleaned up
+                when the Node is deleted. For failed scale-up nodes where no K8s Node object
+                exists, owner references are omitted.
+              properties:
+                instanceType:
+                  description: The instance type of the node being removed.
+                  type: string
+                nodeName:
+                  description: The name of the Kubernetes Node to be removed.
+                  type: string
+                pool:
+                  description: The NodePool this node belongs to.
+                  type: string
+              required:
+                - instanceType
+                - nodeName
+                - pool
+              type: object
+            status:
+              description: Status of a NodeRemovalRequest.
+              nullable: true
+              properties:
+                lastTransitionTime:
+                  description: Timestamp of the last phase transition.
+                  format: date-time
+                  nullable: true
+                  type: string
+                phase:
+                  default: Pending
+                  description: Current phase of the NodeRemovalRequest.
+                  enum:
+                    - Pending
+                    - Deprovisioning
+                    - CouldNotRemove
+                  type: string
+                removalAttempts:
+                  default: 0
+                  description: Number of times removal has been attempted.
+                  format: uint32
+                  minimum: 0.0
+                  type: integer
+              type: object
+          required:
+            - spec
+          title: NodeRemovalRequest
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: hetznernodeclasses.growth.vettrdev.com
+spec:
+  group: growth.vettrdev.com
+  names:
+    categories: []
+    kind: HetznerNodeClass
+    plural: hetznernodeclasses
+    shortNames:
+      - hnc
+    singular: hetznernodeclass
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns: []
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for HetznerNodeClassSpec via `CustomResource`
+          properties:
+            spec:
+              description: Spec for a HetznerNodeClass — provider-specific instance configuration.
+              properties:
+                enableIpv4:
+                  description: Whether to enable IPv4 on the public interface.
+                  nullable: true
+                  type: boolean
+                enableIpv6:
+                  description: Whether to enable IPv6 on the public interface.
+                  nullable: true
+                  type: boolean
+                firewallIds:
+                  default: []
+                  description: "[Hetzner firewall IDs](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.firewalls) to apply to the server."
+                  items:
+                    format: int64
+                    type: integer
+                  type: array
+                hetznerLabels:
+                  additionalProperties:
+                    type: string
+                  default: {}
+                  description: |-
+                    Labels that will be [visible in Hetzner Cloud](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.labels) for the resource. This will be in addition
+                    to the default labels that are added to all servers, {"managed-by": "growth", }, and
+                    labels from the NodePool this is attached to.
+                  type: object
+                image:
+                  description: '[OS image for the server](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.image), e.g. "ubuntu-24.04"'
+                  type: string
+                networkIds:
+                  default: []
+                  description: "[Hetzner network IDs](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.networks) to attach to the server's private interface."
+                  items:
+                    format: int64
+                    type: integer
+                  type: array
+                sshKeyNames:
+                  default: []
+                  description: "[Hetzner SSH key names](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.ssh_keys) to install on the server."
+                  items:
+                    type: string
+                  type: array
+                userData:
+                  description: "[User-data template](https://docs.hetzner.cloud/reference/cloud#tag/servers/create_server.body.user_data) configuration with variable substitution."
+                  properties:
+                    templateRef:
+                      description: ConfigMap containing the raw template (e.g. cloud-init YAML).
+                      properties:
+                        key:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                        - key
+                        - name
+                        - namespace
+                      type: object
+                    variables:
+                      default: []
+                      description: |-
+                        Named variables whose values replace `{{ name }}` placeholders.
+                        Defaults - [[RESERVED_DYNAMIC_VARS]]
+                      items:
+                        description: "A single template variable: a name and a Secret reference for its value."
+                        properties:
+                          name:
+                            description: Placeholder name — used as `{{ name }}` in the template.
+                            type: string
+                          secretRef:
+                            description: Where to read the substitution value from.
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                type: string
+                              namespace:
+                                type: string
+                            required:
+                              - key
+                              - name
+                              - namespace
+                            type: object
+                        required:
+                          - name
+                          - secretRef
+                        type: object
+                      type: array
+                  required:
+                    - templateRef
+                  type: object
+              required:
+                - image
+                - userData
+              type: object
+          required:
+            - spec
+          title: HetznerNodeClass
+          type: object
+      served: true
+      storage: true
+      subresources: {}

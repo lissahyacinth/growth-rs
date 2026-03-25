@@ -1,0 +1,4 @@
+[env]
+# Ensure tests run sequentially. The E2E affinity tests share cluster
+# state (KWOK nodes, pods) and must not overlap.
+RUST_TEST_THREADS = "1"

@@ -9,15 +9,11 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::controller::errors::{ConfigError, ControllerError};
-use crate::crds::user_data::UserDataError;
+use crate::resources::user_data::UserDataError;
 
-/// Check whether a `kube::Error` is a 404 Not Found API response.
-pub(crate) fn is_kube_not_found(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(resp) if resp.code == 404)
-}
-use crate::crds::node_pool::NodePool;
-use crate::crds::node_request::{NodeRequest, NodeRequestPhase, NodeRequestStatus};
 use crate::providers::provider::Provider;
+use crate::resources::node_pool::NodePool;
+use crate::resources::node_request::{NodeRequest, NodeRequestPhase, NodeRequestStatus};
 
 const CUSTOM_RESOURCE_DEFINITIONS: [&str; 4] = [
     "noderequests.growth.vettrdev.com",
@@ -25,6 +21,11 @@ const CUSTOM_RESOURCE_DEFINITIONS: [&str; 4] = [
     "noderemovalrequests.growth.vettrdev.com",
     "hetznernodeclasses.growth.vettrdev.com",
 ];
+
+/// Check whether a `kube::Error` is a 404 Not Found API response.
+pub(crate) fn is_kube_not_found(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(resp) if resp.code == 404)
+}
 
 pub(crate) async fn update_node_request_phase(
     client: &Client,

@@ -1,0 +1,26 @@
+---
+image:
+  repository: ghcr.io/lissahyacinth/growthrs
+  tag: latest
+  port: 8080
+
+provider: hetzner
+provisioningTimeout: 300  # seconds
+coolingDuration: 15       # seconds — idle time before scale-down
+removalAttempts: 5
+unmetTtl: 120             # seconds — Unmet NodeRequest lifetime
+
+logLevel: "growthrs=info"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Hetzner-specific (only required when provider=hetzner)
+hcloud:
+  tokenSecretName: hcloud-token
+  tokenSecretKey: token

@@ -1,11 +1,11 @@
+pub mod clock;
+pub mod config;
 pub mod controller;
-pub mod crds;
 pub mod offering;
 pub mod optimiser;
 pub mod providers;
+pub mod resources;
 
 /// Shared test helpers for integration tests and the `test_pod` binary.
-///
-/// Always compiled — contains no heavy dependencies and the compiler
-/// eliminates unused code in release builds.
+#[cfg(feature = "testing")]
 pub mod testing;

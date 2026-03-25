@@ -1,0 +1,8 @@
+apiVersion: v2
+name: growth
+version: 0.1.0
+description: Node Scaler for Kubernetes on Hetzner
+kubeVersion: ">=1.22.0-0"
+maintainers:
+  - name: Lissa Hyacinth
+    email: lissahyacinth@gmail.com

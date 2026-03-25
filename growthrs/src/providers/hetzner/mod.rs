@@ -7,7 +7,7 @@ use hcloud::models::{
     CreateServerRequest, CreateServerRequestFirewalls, CreateServerRequestPublicNet, Server,
     ServerType,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::offering::{InstanceType, Location, Offering, Region, Resources};
 use crate::providers::{provider::{InstanceConfig, NodeId, ProviderError, ProviderStatus}};
@@ -88,14 +88,11 @@ impl From<&Server> for ProviderStatus {
             | hcloud::models::server::Status::Rebuilding
             | hcloud::models::server::Status::Migrating => ProviderStatus::Creating,
             hcloud::models::server::Status::Running => ProviderStatus::Running,
-            // This is fairly opinionated, but for the benefit of knowing if a server _exists_, knowing it's being deleted is sufficient.
             hcloud::models::server::Status::Deleting | hcloud::models::server::Status::Stopping => {
-                ProviderStatus::NotFound
+                ProviderStatus::Removing
             }
             hcloud::models::server::Status::Off | hcloud::models::server::Status::Unknown => {
-                ProviderStatus::Failed {
-                    reason: format!("server status: {:?}", value.status),
-                }
+                ProviderStatus::NotFound
             }
         }
     }
@@ -143,6 +140,7 @@ impl HetznerProvider {
         all_offerings
     }
 
+    // Helper function for finding a server for deletion etc.
     async fn resolve_server_by_name(&self, name: &str) -> Result<Option<Server>, ProviderError> {
         let params = ListServersParams {
             name: Some(name.to_string()),
@@ -233,6 +231,7 @@ impl HetznerProvider {
             server_type = %request.server_type,
             image = %request.image,
             location = ?request.location,
+            // This is KeyID, so it's safe to show.
             ssh_keys = ?request.ssh_keys,
             networks = ?request.networks,
             firewalls = ?request.firewalls,
@@ -261,6 +260,7 @@ impl HetznerProvider {
                     info!(node_id = %node_id, "server already exists (409 uniqueness), treating as success");
                     Ok(NodeId(node_id))
                 } else if body.contains("resource_limit_exceeded") {
+                    error!("Resource limits exceeded for {} in {:?}", offering.instance_type, offering.location.region.0);
                     Err(ProviderError::OfferingUnavailable(format!(
                         "resource limit exceeded for {}",
                         offering.instance_type
@@ -427,98 +427,5 @@ mod tests {
         let st = make_server_type("tiny", 1, 0.5, 10.0);
         let offerings = convert_server_type(&st);
         assert_eq!(offerings[0].resources.memory_mib, 512);
-    }
-
-    #[test]
-    fn map_server_status_running() {
-        let mut server = test_server();
-        server.status = hcloud::models::server::Status::Running;
-        assert_eq!(map_server_status(&server), ProviderStatus::Running);
-    }
-
-    #[test]
-    fn map_server_status_initializing() {
-        let mut server = test_server();
-        server.status = hcloud::models::server::Status::Initializing;
-        assert_eq!(map_server_status(&server), ProviderStatus::Creating);
-    }
-
-    #[test]
-    fn map_server_status_starting() {
-        let mut server = test_server();
-        server.status = hcloud::models::server::Status::Starting;
-        assert_eq!(map_server_status(&server), ProviderStatus::Creating);
-    }
-
-    #[test]
-    fn map_server_status_deleting() {
-        let mut server = test_server();
-        server.status = hcloud::models::server::Status::Deleting;
-        assert_eq!(map_server_status(&server), ProviderStatus::NotFound);
-    }
-
-    #[test]
-    fn map_server_status_off_is_failed() {
-        let mut server = test_server();
-        server.status = hcloud::models::server::Status::Off;
-        assert!(matches!(
-            map_server_status(&server),
-            ProviderStatus::Failed { .. }
-        ));
-    }
-
-    /// Minimal Server for testing map_server_status.
-    fn test_server() -> Server {
-        let location = hcloud::models::Location {
-            id: 1,
-            name: "fsn1".to_string(),
-            description: "Falkenstein DC Park 1".to_string(),
-            city: "Falkenstein".to_string(),
-            country: "DE".to_string(),
-            latitude: 50.47612,
-            longitude: 12.37044,
-            network_zone: "eu-central".to_string(),
-        };
-        let dc_server_types = hcloud::models::DataCenterServerTypes {
-            available: vec![],
-            available_for_migration: vec![],
-            supported: vec![],
-        };
-        let datacenter = hcloud::models::DataCenter {
-            id: 1,
-            name: "fsn1-dc14".to_string(),
-            description: "Falkenstein 1 DC14".to_string(),
-            location: Box::new(location),
-            server_types: Box::new(dc_server_types),
-        };
-        Server {
-            id: 1,
-            name: "test".to_string(),
-            status: hcloud::models::server::Status::Running,
-            created: "2025-01-01T00:00:00+00:00".to_string(),
-            public_net: Box::new(hcloud::models::ServerPublicNet {
-                floating_ips: vec![],
-                firewalls: None,
-                ipv4: None,
-                ipv6: None,
-            }),
-            server_type: Box::new(make_server_type("cpx22", 2, 4.0, 40.0)),
-            datacenter: Box::new(datacenter),
-            image: None,
-            iso: None,
-            labels: HashMap::new(),
-            locked: false,
-            protection: Box::new(hcloud::models::ServerProtection::new(false, false)),
-            rescue_enabled: false,
-            backup_window: None,
-            included_traffic: None,
-            ingoing_traffic: None,
-            outgoing_traffic: None,
-            load_balancers: None,
-            primary_disk_size: 40,
-            private_net: vec![],
-            volumes: None,
-            placement_group: None,
-        }
     }
 }

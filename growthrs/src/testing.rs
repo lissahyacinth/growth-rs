@@ -2,42 +2,91 @@
 //!
 //! Gated behind `#[cfg(any(test, feature = "testing"))]` in `lib.rs`.
 
-use std::collections::BTreeMap;
-use std::time::Duration;
-
-use anyhow::Result;
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, Node, NodeStatus, Pod, PodAffinityTerm, PodAntiAffinity, PodSpec,
-    ResourceRequirements,
+    Affinity, Container, Node, NodeCondition, NodeStatus, Pod, PodAffinityTerm, PodAntiAffinity,
+    PodSpec, ResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::api::{DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::{Api, Client, Config};
 
-use crate::crds::node_pool::{NodePool, NodePoolSpec, ServerTypeConfig};
+use crate::resources::node_pool::{NodePool, NodePoolSpec, ServerTypeConfig};
+
+use crate::config::ControllerContext;
+use crate::offering::{MANAGED_BY_LABEL, MANAGED_BY_SELECTOR, POOL_LABEL, Resources};
+use crate::providers::kwok::to_capacity;
+use crate::providers::provider::Provider;
+use crate::resources::node_removal_request::NodeRemovalRequest;
+use crate::resources::node_request::NodeRequest;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+
+/// Default kubeconfig context used for integration tests.
+///
+/// Override with `KUBE_CONTEXT` env var to target a different cluster.
+const DEFAULT_TEST_CONTEXT: &str = "default";
 
 /// Build a kube client for E2E tests.
 ///
-/// If `KUBE_PROXY_URL` is set (e.g. `https://127.0.0.1:16443`), the client
-/// connects through that endpoint instead of the kubeconfig default. This
-/// lets you interpose a TCP proxy (toxiproxy, stunnel, etc.) without
-/// changing any test logic.
+/// Context selection (in priority order):
+/// 1. `KUBE_CONTEXT` env var — use a specific kubeconfig context.
+/// 2. Falls back to `rancher-desktop` context.
+///
+/// If `KUBE_PROXY_URL` is also set, the cluster URL is overridden to that
+/// endpoint (useful for toxiproxy / stunnel interposition).
 pub async fn test_client() -> Client {
-    match std::env::var("KUBE_PROXY_URL") {
-        Ok(url) => {
-            let mut config = Config::infer().await.unwrap();
-            config.cluster_url = url.parse().expect("KUBE_PROXY_URL is not a valid URL");
-            config.accept_invalid_certs = true;
-            Client::try_from(config).unwrap()
-        }
-        Err(_) => Client::try_default().await.unwrap(),
+    let context =
+        std::env::var("KUBE_CONTEXT").unwrap_or_else(|_| DEFAULT_TEST_CONTEXT.to_string());
+
+    let mut config = Config::from_kubeconfig(&kube::config::KubeConfigOptions {
+        context: Some(context.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|e| panic!("failed to load kubeconfig context {context:?}: {e}"));
+
+    if let Ok(url) = std::env::var("KUBE_PROXY_URL") {
+        config.cluster_url = url.parse().expect("KUBE_PROXY_URL is not a valid URL");
+        config.accept_invalid_certs = true;
     }
+
+    Client::try_from(config).unwrap()
 }
-use crate::crds::node_removal_request::NodeRemovalRequest;
-use crate::crds::node_request::NodeRequest;
-use crate::offering::{POOL_LABEL, Resources};
-use crate::providers::kwok::to_capacity;
+
+/// Initialise tracing for tests. Safe to call multiple times (subsequent calls are no-ops).
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
+
+/// Build a [`ControllerContext`] for integration tests.
+///
+/// Uses the given provider and default timeouts / scale-down config.
+/// Tests needing custom `ScaleDownConfig` should construct `ControllerContext` directly.
+pub fn make_test_ctx(client: Client, provider: Provider) -> Arc<ControllerContext> {
+    Arc::new(ControllerContext {
+        client,
+        provider,
+        provisioning_timeout: Duration::from_secs(300),
+        scale_down: crate::config::ScaleDownConfig::default(),
+        clock: Arc::new(crate::clock::SystemClock),
+    })
+}
+
+/// Check whether a node carries a specific taint (by key and effect).
+pub fn has_taint(node: &Node, key: &str, effect: &str) -> bool {
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .map(|ts| ts.iter().any(|t| t.key == key && t.effect == effect))
+        .unwrap_or(false)
+}
 
 /// Validate that a string looks like a Kubernetes resource quantity.
 pub fn validate_quantity(value: &str, field: &str) -> Result<()> {
@@ -49,7 +98,7 @@ pub fn validate_quantity(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse a server type spec like "cx22:10" or "cx22:2:10" (name:max or name:min:max).
+/// Parse a server type spec like "cpx22:10" or "cpx22:2:10" (name:max or name:min:max).
 pub fn parse_server_type(s: &str) -> Result<ServerTypeConfig> {
     let parts: Vec<&str> = s.split(':').collect();
     match parts.as_slice() {
@@ -95,7 +144,7 @@ pub async fn create_pod(
         metadata: ObjectMeta {
             name: Some(name.into()),
             labels: Some(BTreeMap::from([(
-                "app.kubernetes.io/managed-by".into(),
+                MANAGED_BY_LABEL.into(),
                 "growth-test".into(),
             )])),
             ..Default::default()
@@ -171,7 +220,7 @@ pub async fn create_node_pool(
 pub async fn nuke(client: Client) -> Result<()> {
     // Delete test pods (managed-by=growth-test)
     let pods: Api<Pod> = Api::all(client.clone());
-    let lp = ListParams::default().labels("app.kubernetes.io/managed-by=growth-test");
+    let lp = ListParams::default().labels(&format!("{MANAGED_BY_LABEL}=growth-test"));
     let pod_list = pods.list(&lp).await?;
     let pod_count = pod_list.items.len();
     for pod in &pod_list {
@@ -186,7 +235,7 @@ pub async fn nuke(client: Client) -> Result<()> {
 
     // Delete growth-managed nodes (managed-by=growth)
     let nodes: Api<Node> = Api::all(client.clone());
-    let lp = ListParams::default().labels("app.kubernetes.io/managed-by=growth");
+    let lp = ListParams::default().labels(MANAGED_BY_SELECTOR);
     let node_list = nodes.list(&lp).await?;
     let node_count = node_list.items.len();
     for node in &node_list {
@@ -196,7 +245,7 @@ pub async fn nuke(client: Client) -> Result<()> {
     println!("deleted {node_count} growth-managed nodes");
 
     // Delete KWOK test nodes (managed-by=growth-test)
-    let lp = ListParams::default().labels("app.kubernetes.io/managed-by=growth-test");
+    let lp = ListParams::default().labels(&format!("{MANAGED_BY_LABEL}=growth-test"));
     let node_list = nodes.list(&lp).await?;
     let node_count = node_list.items.len();
     for node in &node_list {
@@ -205,12 +254,27 @@ pub async fn nuke(client: Client) -> Result<()> {
     }
     println!("deleted {node_count} growth-test nodes");
 
-    // Delete all NodeRemovalRequests
+    // Delete all NodeRemovalRequests (strip finalizers first to avoid blocking on terminating NRRs)
     let nrrs: Api<NodeRemovalRequest> = Api::all(client.clone());
     let nrr_list = nrrs.list(&ListParams::default()).await?;
     let nrr_count = nrr_list.items.len();
     for nrr in &nrr_list {
         let name = nrr.metadata.name.as_deref().unwrap_or("?");
+        if nrr
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| !f.is_empty())
+        {
+            let patch = serde_json::json!({ "metadata": { "finalizers": null } });
+            let _ = nrrs
+                .patch(
+                    name,
+                    &kube::api::PatchParams::apply("growthrs-test"),
+                    &kube::api::Patch::Merge(patch),
+                )
+                .await;
+        }
         let _ = nrrs.delete(name, &DeleteParams::default()).await;
     }
     println!("deleted {nrr_count} NodeRemovalRequests");
@@ -235,18 +299,25 @@ pub async fn nuke(client: Client) -> Result<()> {
     }
     println!("deleted {np_count} NodePools");
 
-    // Wait for pods and nodes to be fully removed (avoids "object is being deleted" races)
+    // Wait for pods, nodes, and NRRs to be fully removed (avoids "object is being deleted" races)
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let lp = ListParams::default().labels("app.kubernetes.io/managed-by=growth-test");
-        let remaining_pods = pods.list(&lp).await?.items.len();
-        let remaining_nodes = nodes.list(&lp).await?.items.len();
-        if remaining_pods == 0 && remaining_nodes == 0 {
+        let lp_test = ListParams::default().labels(&format!("{MANAGED_BY_LABEL}=growth-test"));
+        let lp_growth = ListParams::default().labels(MANAGED_BY_SELECTOR);
+        let remaining_test_pods = pods.list(&lp_test).await?.items.len();
+        let remaining_test_nodes = nodes.list(&lp_test).await?.items.len();
+        let remaining_growth_nodes = nodes.list(&lp_growth).await?.items.len();
+        let remaining_nrrs = nrrs.list(&ListParams::default()).await?.items.len();
+        let total =
+            remaining_test_pods + remaining_test_nodes + remaining_growth_nodes + remaining_nrrs;
+        if total == 0 {
             break;
         }
         if tokio::time::Instant::now() > deadline {
             println!(
-                "warning: nuke timed out waiting for deletion ({remaining_pods} pods, {remaining_nodes} nodes remaining)"
+                "warning: nuke timed out waiting for deletion ({remaining_test_pods} test pods, \
+                 {remaining_test_nodes} test nodes, {remaining_growth_nodes} growth nodes, \
+                 {remaining_nrrs} NRRs remaining)"
             );
             break;
         }
@@ -257,6 +328,12 @@ pub async fn nuke(client: Client) -> Result<()> {
 }
 
 /// Create a KWOK (fake) node with specified resources and labels.
+/// Create a KWOK node for test infrastructure.
+///
+/// These nodes simulate already-ready infrastructure — they are NOT going through
+/// GrowthRS's provisioning lifecycle, so they don't carry the startup taint
+/// (`growth.vettrdev.com/unregistered:NoExecute`). We set `Ready=True` explicitly
+/// to prevent the node lifecycle controller from adding `unreachable` taints.
 pub async fn create_kwok_node(
     client: Client,
     name: &str,
@@ -271,9 +348,13 @@ pub async fn create_kwok_node(
 
     let mut labels = BTreeMap::from([
         ("type".into(), "kwok".into()),
-        ("app.kubernetes.io/managed-by".into(), "growth-test".into()),
+        (MANAGED_BY_LABEL.into(), "growth-test".into()),
     ]);
     labels.extend(extra_labels);
+
+    let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::now(),
+    );
 
     let node = Node {
         metadata: ObjectMeta {
@@ -288,6 +369,15 @@ pub async fn create_kwok_node(
         status: Some(NodeStatus {
             capacity: Some(capacity),
             allocatable: Some(allocatable),
+            conditions: Some(vec![NodeCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                last_heartbeat_time: Some(now.clone()),
+                last_transition_time: Some(now),
+                reason: Some("KwokReady".into()),
+                message: Some("KWOK test node".into()),
+                ..Default::default()
+            }]),
             ..Default::default()
         }),
         spec: None,
@@ -323,8 +413,7 @@ pub async fn create_pod_with_affinity(
         ("memory".into(), Quantity(memory.into())),
     ]);
 
-    let mut node_selector =
-        pool.map(|p| BTreeMap::from([(POOL_LABEL.to_string(), p.to_string())]));
+    let mut node_selector = pool.map(|p| BTreeMap::from([(POOL_LABEL.to_string(), p.to_string())]));
     // Ensure pods only land on KWOK nodes
     node_selector
         .get_or_insert_with(BTreeMap::new)
@@ -332,7 +421,7 @@ pub async fn create_pod_with_affinity(
 
     let pod_labels = BTreeMap::from([
         ("app".into(), app_label.into()),
-        ("app.kubernetes.io/managed-by".into(), "growth-test".into()),
+        (MANAGED_BY_LABEL.into(), "growth-test".into()),
     ]);
 
     let affinity_term = PodAffinityTerm {
@@ -397,7 +486,11 @@ pub async fn create_pod_with_affinity(
 /// List all NodeRequests in the cluster.
 pub async fn list_node_requests(client: Client) -> Result<Vec<NodeRequest>> {
     let api: Api<NodeRequest> = Api::all(client);
-    Ok(api.list(&ListParams::default()).await?.into_iter().collect())
+    Ok(api
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .collect())
 }
 
 /// Poll until at least `min_count` NodeRequests exist, or timeout.
@@ -410,7 +503,11 @@ pub async fn wait_for_node_requests(
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        let nrs: Vec<NodeRequest> = api.list(&ListParams::default()).await?.into_iter().collect();
+        let nrs: Vec<NodeRequest> = api
+            .list(&ListParams::default())
+            .await?
+            .into_iter()
+            .collect();
         if nrs.len() >= min_count {
             return Ok(nrs);
         }
@@ -425,7 +522,11 @@ pub async fn wait_for_node_requests(
 }
 
 /// Poll until a pod has `spec.nodeName` set (i.e. it was scheduled), or timeout.
-pub async fn wait_for_pod_scheduled(client: Client, name: &str, timeout: Duration) -> Result<String> {
+pub async fn wait_for_pod_scheduled(
+    client: Client,
+    name: &str,
+    timeout: Duration,
+) -> Result<String> {
     let pods: Api<Pod> = Api::default_namespaced(client);
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -460,7 +561,12 @@ pub async fn wait_for_pod_unschedulable(
         }
 
         let pod = pods.get(name).await?;
-        if pod.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some() {
+        if pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_ref())
+            .is_some()
+        {
             anyhow::bail!("pod {name} was unexpectedly scheduled");
         }
 
@@ -471,5 +577,9 @@ pub async fn wait_for_pod_unschedulable(
 /// List all NodeRemovalRequests in the cluster.
 pub async fn list_node_removal_requests(client: Client) -> Result<Vec<NodeRemovalRequest>> {
     let api: Api<NodeRemovalRequest> = Api::all(client);
-    Ok(api.list(&ListParams::default()).await?.into_iter().collect())
+    Ok(api
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .collect())
 }

@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 
-use kube::Client;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::controller::helpers::{read_configmap_key, read_secret_key};
-use crate::offering::Offering;
+use crate::offering::{Offering, STARTUP_TAINT_KEY};
 
 /// Dynamic variable names injected per-node at provision time.
 /// User-declared variables must not collide with these.
-pub const RESERVED_DYNAMIC_VARS: &[&str] = &["REGION", "LOCATION", "INSTANCE_TYPE", "NODE_LABELS"];
+pub const RESERVED_DYNAMIC_VARS: &[&str] = &[
+    "REGION",
+    "INSTANCE_TYPE",
+    "NODE_LABELS",
+    "NODE_TAINTS",
+];
 
 /// Reference to a specific key in a Kubernetes ConfigMap.
 ///
@@ -51,7 +54,7 @@ pub struct UserDataConfig {
     /// Named variables whose values replace `{{ name }}` placeholders.
     /// Defaults - [[RESERVED_DYNAMIC_VARS]]
     #[serde(default)]
-    pub variables: Option<Vec<TemplateVariable>>,
+    pub variables: Vec<TemplateVariable>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,12 +78,17 @@ pub enum UserDataError {
         reason: String,
     },
     #[error(
-        "variable {name:?} collides with reserved dynamic variable — reserved names: REGION, LOCATION, INSTANCE_TYPE, NODE_LABELS"
+        "variable {name:?} collides with reserved dynamic variable — reserved names: {reserved}",
+        reserved = RESERVED_DYNAMIC_VARS.join(", ")
     )]
     ReservedNameCollision { name: String },
 }
 
 /// Replace all `{{ VARIABLE }}` placeholders in the template.
+///
+/// Substitution is sequential: each variable's value is inserted before the
+/// next variable is processed. This means a variable value containing
+/// `{{ OTHER }}` will be substituted if `OTHER` is a later variable.
 ///
 /// Fails if:
 /// - A defined variable's placeholder is absent from the template.
@@ -102,13 +110,17 @@ pub fn resolve_template(
     }
 
     // Check for any remaining unresolved placeholders.
-    if let Some(start) = result.find("{{ ")
-        && let Some(end) = result[start..].find(" }}")
-    {
-        let name = &result[start + 3..start + end];
-        return Err(UserDataError::UnresolvedPlaceholder {
-            name: name.to_string(),
-        });
+    let mut search_from = 0;
+    while let Some(rel_start) = result[search_from..].find("{{ ") {
+        let start = search_from + rel_start;
+        if let Some(rel_end) = result[start + 3..].find(" }}") {
+            let name = &result[start + 3..start + 3 + rel_end];
+            return Err(UserDataError::UnresolvedPlaceholder {
+                name: name.to_string(),
+            });
+        }
+        // No closing `}}` found — not a placeholder, skip past `{{ `.
+        search_from = start + 3;
     }
 
     Ok(result)
@@ -116,8 +128,9 @@ pub fn resolve_template(
 
 /// Build the per-node dynamic variables from the offering and labels.
 ///
-/// These are the reserved dynamic variables (REGION, LOCATION, INSTANCE_TYPE,
-/// NODE_LABELS) that are injected at provision time regardless of provider.
+/// These are the reserved dynamic variables (REGION, INSTANCE_TYPE,
+/// NODE_LABELS, NODE_TAINTS) that are injected at provision time regardless
+/// of provider.
 pub(crate) fn build_dynamic_vars(
     offering: &Offering,
     labels: &BTreeMap<String, String>,
@@ -128,68 +141,19 @@ pub(crate) fn build_dynamic_vars(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let node_taints_str = format!("--register-with-taints={STARTUP_TAINT_KEY}=:NoExecute");
+
     vec![
         ("REGION".to_string(), offering.location.region.0.clone()),
-        ("LOCATION".to_string(), offering.location.region.0.clone()),
         (
             "INSTANCE_TYPE".to_string(),
             offering.instance_type.0.clone(),
         ),
         ("NODE_LABELS".to_string(), node_labels_str),
+        ("NODE_TAINTS".to_string(), node_taints_str),
     ]
 }
 
-impl UserDataConfig {
-    /// Resolve the user-data template: read ConfigMap + Secret values, merge
-    /// dynamic per-node variables, and perform template substitution.
-    ///
-    /// This is the imperative-shell entry point for template resolution.
-    /// All K8s I/O (ConfigMap/Secret reads) happens here; the actual
-    /// substitution is delegated to the pure `resolve_template()`.
-    pub(crate) async fn resolve(
-        &self,
-        client: &Client,
-        offering: &Offering,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<String, UserDataError> {
-        // 1. Read template from ConfigMap.
-        let tpl_ref = &self.template_ref;
-        let template =
-            read_configmap_key(client, &tpl_ref.namespace, &tpl_ref.name, &tpl_ref.key).await?;
-
-        // 2. Read secret variable values + validate reserved name collisions.
-        let mut secret_vars = Vec::new();
-        if let Some(vars) = &self.variables {
-            for var in vars {
-                if RESERVED_DYNAMIC_VARS.contains(&var.name.as_str()) {
-                    return Err(UserDataError::ReservedNameCollision {
-                        name: var.name.clone(),
-                    });
-                }
-                let value = read_secret_key(
-                    client,
-                    &var.secret_ref.namespace,
-                    &var.secret_ref.name,
-                    &var.secret_ref.key,
-                )
-                .await?;
-                secret_vars.push((var.name.clone(), value));
-            }
-        }
-
-        // 3. Merge secret vars + dynamic per-node vars, resolve template.
-        let dynamic_vars = build_dynamic_vars(offering, labels);
-        let mut all_vars = secret_vars;
-        for (name, value) in dynamic_vars {
-            let marker = format!("{{{{ {name} }}}}");
-            if template.contains(&marker) {
-                all_vars.push((name, value));
-            }
-        }
-
-        resolve_template(&template, &all_vars)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -257,13 +221,50 @@ mod tests {
 
         let vars = build_dynamic_vars(&offering, &labels);
         let names: Vec<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"REGION"));
-        assert!(names.contains(&"LOCATION"));
-        assert!(names.contains(&"INSTANCE_TYPE"));
-        assert!(names.contains(&"NODE_LABELS"));
+
+        assert_eq!(
+            vars.len(),
+            RESERVED_DYNAMIC_VARS.len(),
+            "build_dynamic_vars should produce exactly one entry per reserved var"
+        );
+        for &reserved in RESERVED_DYNAMIC_VARS {
+            assert!(
+                names.contains(&reserved),
+                "missing reserved dynamic var: {reserved}"
+            );
+        }
 
         let instance_type_val = vars.iter().find(|(n, _)| n == "INSTANCE_TYPE").unwrap();
         assert_eq!(instance_type_val.1, "cpx22");
+    }
+
+    #[test]
+    fn build_dynamic_vars_node_taints_has_register_with_taints_flag() {
+        use crate::offering::{InstanceType, Location, Offering, Region, Resources};
+
+        let offering = Offering {
+            instance_type: InstanceType("cax11".into()),
+            resources: Resources {
+                cpu: 2,
+                memory_mib: 4096,
+                ephemeral_storage_gib: None,
+                gpu: 0,
+                gpu_model: None,
+            },
+            cost_per_hour: 0.01,
+            location: Location {
+                region: Region("fsn1".into()),
+                zone: None,
+            },
+        };
+        let labels = std::collections::BTreeMap::new();
+
+        let vars = build_dynamic_vars(&offering, &labels);
+        let node_taints = vars.iter().find(|(n, _)| n == "NODE_TAINTS").unwrap();
+        assert_eq!(
+            node_taints.1,
+            "--register-with-taints=growth.vettrdev.com/unregistered=:NoExecute"
+        );
     }
 
     #[test]
@@ -275,5 +276,33 @@ mod tests {
             matches!(err, UserDataError::UnresolvedPlaceholder { ref name } if name == "SERVER_URL"),
             "expected UnresolvedPlaceholder for SERVER_URL, got {err}"
         );
+    }
+
+    #[test]
+    fn resolve_template_unresolved_after_substitution_names_correct_variable() {
+        // Regression: the unresolved placeholder check must not greedily match
+        // across multiple `{{ }}` pairs. When the first var is substituted and
+        // the second is not, the error must name the second variable.
+        let template = "a={{ A }}\nb={{ B }}\n";
+        let vars = vec![("A".to_string(), "val_a".to_string())];
+        let err = resolve_template(template, &vars).unwrap_err();
+        assert!(
+            matches!(err, UserDataError::UnresolvedPlaceholder { ref name } if name == "B"),
+            "expected UnresolvedPlaceholder for B, got {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_template_value_containing_placeholder_syntax_is_substituted() {
+        // Documents current behavior: variable values are not escaped, so a
+        // value containing `{{ X }}` will be substituted if X is a later
+        // variable. This is sequential pass-through, not a bug.
+        let template = "config={{ OUTER }}\n";
+        let vars = vec![
+            ("OUTER".to_string(), "prefix-{{ INNER }}-suffix".to_string()),
+            ("INNER".to_string(), "resolved".to_string()),
+        ];
+        let result = resolve_template(template, &vars).unwrap();
+        assert_eq!(result, "config=prefix-resolved-suffix\n");
     }
 }

@@ -1,6 +1,7 @@
 //! E2E affinity tests — require a KWOK-enabled cluster.
 //!
-//! Run with: `cargo test --manifest-path growthrs/Cargo.toml`
+//! Run with: `cargo test --manifest-path growthrs/Cargo.toml --features testing`
+#![cfg(feature = "testing")]
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use growthrs::offering::Resources;
 use growthrs::testing;
 
-fn cx22_resources() -> Resources {
+fn cpx22_resources() -> Resources {
     Resources {
         cpu: 2,
         memory_mib: 4096,
@@ -34,7 +35,7 @@ async fn e2e_anti_affinity_zone_spread() {
     // Clean slate
     testing::nuke(client.clone()).await.unwrap();
 
-    let res = cx22_resources();
+    let res = cpx22_resources();
     let topo = "topology.kubernetes.io/zone";
 
     // Create 3 KWOK nodes in 3 zones
@@ -57,7 +58,7 @@ async fn e2e_anti_affinity_zone_spread() {
             "512Mi",
             "web",
             topo,
-            true,  // anti-affinity
+            true, // anti-affinity
             None,
         )
         .await
@@ -97,7 +98,7 @@ async fn e2e_affinity_co_location() {
     let client = growthrs::testing::test_client().await;
     testing::nuke(client.clone()).await.unwrap();
 
-    let res = cx22_resources();
+    let res = cpx22_resources();
     let topo = "topology.kubernetes.io/zone";
 
     // Create 2 nodes in zone-a and 1 in zone-b
@@ -116,7 +117,7 @@ async fn e2e_affinity_co_location() {
         testing::create_pod_with_affinity(
             client.clone(),
             &format!("cache-{i}"),
-            "1",
+            "0.5",
             "512Mi",
             "cache",
             topo,
@@ -128,20 +129,12 @@ async fn e2e_affinity_co_location() {
     }
 
     // Verify both pods get scheduled
-    let node0 = testing::wait_for_pod_scheduled(
-        client.clone(),
-        "cache-0",
-        Duration::from_secs(60),
-    )
-    .await
-    .unwrap();
-    let node1 = testing::wait_for_pod_scheduled(
-        client.clone(),
-        "cache-1",
-        Duration::from_secs(60),
-    )
-    .await
-    .unwrap();
+    let node0 = testing::wait_for_pod_scheduled(client.clone(), "cache-0", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let node1 = testing::wait_for_pod_scheduled(client.clone(), "cache-1", Duration::from_secs(60))
+        .await
+        .unwrap();
 
     // Both pods should be on nodes in the same zone.
     // node-a1 and node-a2 are both in zone-a; node-b1 is in zone-b.
@@ -170,7 +163,7 @@ async fn e2e_anti_affinity_insufficient_zones() {
     let client = growthrs::testing::test_client().await;
     testing::nuke(client.clone()).await.unwrap();
 
-    let res = cx22_resources();
+    let res = cpx22_resources();
     let topo = "topology.kubernetes.io/zone";
 
     // Only 2 zones
@@ -227,7 +220,7 @@ async fn e2e_divergence_all_same_zone() {
     let client = growthrs::testing::test_client().await;
     testing::nuke(client.clone()).await.unwrap();
 
-    let res = cx22_resources();
+    let res = cpx22_resources();
     let topo = "topology.kubernetes.io/zone";
 
     // All 3 nodes in the SAME zone

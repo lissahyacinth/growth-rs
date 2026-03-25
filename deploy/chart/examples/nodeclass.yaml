@@ -1,0 +1,35 @@
+# Example HetznerNodeClass — provider-specific instance configuration.
+#
+# Prerequisites:
+#   1. Create the cloud-init ConfigMap:
+#      kubectl create configmap k3s-cloud-init \
+#        --from-file=cloud-init.sh=examples/cloud-init.sh
+#
+#   2. Create the join-token Secret:
+#      kubectl create secret generic k3s-join \
+#        --from-literal=url=https://<API_SERVER_IP>:6443 \
+#        --from-literal=token=<K3S_TOKEN>
+apiVersion: growth.vettrdev.com/v1alpha1
+kind: HetznerNodeClass
+metadata:
+  name: k3s-agent
+spec:
+  image: ubuntu-24.04
+  sshKeyNames:
+    - my-ssh-key              # Replace with your Hetzner SSH key name
+  userData:
+    templateRef:
+      name: k3s-cloud-init    # ConfigMap with the cloud-init template
+      namespace: default
+      key: cloud-init.sh
+    variables:
+      - name: K3S_URL
+        secretRef:
+          name: k3s-join
+          namespace: default
+          key: url
+      - name: K3S_TOKEN
+        secretRef:
+          name: k3s-join
+          namespace: default
+          key: token

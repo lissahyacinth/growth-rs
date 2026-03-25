@@ -1,0 +1,62 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      serviceAccountName: growth-controller
+      containers:
+        - name: {{ .Release.Name }}
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          ports:
+            - containerPort: {{ .Values.image.port }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: GROWTH_PROVIDER
+              value: {{ .Values.provider | quote }}
+            - name: GROWTH_PROVISIONING_TIMEOUT
+              value: {{ .Values.provisioningTimeout | quote }}
+            - name: GROWTH_COOLING_DURATION
+              value: {{ .Values.coolingDuration | quote }}
+            - name: GROWTH_REMOVAL_ATTEMPTS
+              value: {{ .Values.removalAttempts | quote }}
+            - name: GROWTH_UNMET_TTL
+              value: {{ .Values.unmetTtl | quote }}
+            {{- if eq .Values.provider "hetzner" }}
+            - name: HCLOUD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hcloud.tokenSecretName }}
+                  key: {{ .Values.hcloud.tokenSecretKey }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.image.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.image.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10

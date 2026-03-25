@@ -1,79 +1,109 @@
+/// Watch for unschedulable pods and reconcile them with NodeRequests.
 mod decision;
 mod helpers;
 pub(crate) mod watcher;
 pub use decision::*;
 pub use helpers::{is_daemonset_pod, is_pod_unschedulable};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use kube::api::ListParams;
 use kube::{Api, Client};
-use tokio::time::Instant;
 use tracing::{debug, instrument, warn};
 
 use crate::controller::errors::ControllerError;
-use crate::crds::node_pool::NodePool;
-use crate::crds::node_request::{
-    NodeRequest, NodeRequestPhase, NodeRequestSpec, create_node_request,
-};
-use crate::offering::{INSTANCE_TYPE_LABEL, MANAGED_BY_SELECTOR, POOL_LABEL};
+use crate::controller::node_requests::helpers::create_node_request;
+use crate::controller::node_requests::is_unmet_expired;
+use crate::offering::{INSTANCE_TYPE_LABEL, MANAGED_BY_SELECTOR, Offering, POOL_LABEL, Resources};
+use crate::optimiser::ExistingNode;
 use crate::providers::provider::Provider;
+use crate::resources::node_pool::NodePool;
+use crate::resources::node_request::{NodeRequest, NodeRequestPhase, NodeRequestSpec};
 
-use helpers::merge_occupied_counts;
+use helpers::{lookup_zone, merge_occupied_counts};
 
-/// In-memory cache of recently-created NodeRequest capacity.
-///
-/// Bridges the gap between NodeRequest creation (POST) and the next API list
-/// reflecting it. Unlike the old PendingClaims (which tracked per-pod UIDs),
-/// this tracks per-NodeRequest capacity — no pod-level binding.
-#[derive(Default)]
-pub struct RecentCreates {
-    entries: Vec<RecentEntry>,
+/// Entries older than this are expired regardless of API state.
+const UNCONFIRMED_CREATES_TTL: Duration = Duration::from_secs(60);
+
+/// In-flight NodeRequest capacity — enough data to construct an
+/// `ExistingNode` for the solver.
+#[derive(Debug, Clone)]
+struct InFlightCapacity {
+    pool: String,
+    #[allow(dead_code)] // retained for debug logging
+    instance_type: String,
+    location: String,
+    zone: Option<String>,
+    resources: Resources,
 }
 
-struct RecentEntry {
+/// A single NodeRequest we created but haven't yet seen in the API list.
+struct UnconfirmedCreate {
     /// NodeRequest name (for drain matching against API list).
     nr_name: String,
     capacity: InFlightCapacity,
-    created_at: Instant,
+    created_at: Timestamp,
 }
 
-/// Entries older than this are expired regardless of API state.
-const RECENT_CREATES_TTL: Duration = Duration::from_secs(60);
+/// Write-ahead buffer for NodeRequest capacity not yet reflected in the API.
+///
+/// After creating a NodeRequest (POST), the next API list may not include it
+/// yet. This buffer holds the capacity so the solver doesn't double-provision.
+/// Entries drain automatically once the API list confirms them, or expire
+/// after `UNCONFIRMED_CREATES_TTL`.
+#[derive(Default)]
+pub struct UnconfirmedCreates {
+    entries: Vec<UnconfirmedCreate>,
+}
 
-impl RecentCreates {
-    /// Record a recently-created NodeRequest's capacity.
-    pub fn record(&mut self, nr_name: String, capacity: InFlightCapacity) {
-        self.entries.push(RecentEntry {
+impl UnconfirmedCreates {
+    /// Record a recently-created NodeRequest.
+    pub fn record(
+        &mut self,
+        nr_name: String,
+        pool: String,
+        instance_type: String,
+        location: String,
+        zone: Option<String>,
+        resources: Resources,
+        now: Timestamp,
+    ) {
+        self.entries.push(UnconfirmedCreate {
             nr_name,
-            capacity,
-            created_at: Instant::now(),
+            capacity: InFlightCapacity {
+                pool,
+                instance_type,
+                location,
+                zone,
+                resources,
+            },
+            created_at: now,
         });
     }
 
     /// Drain entries that the API now reflects and expire stale entries.
-    pub fn drain_reflected(&mut self, api_nr_names: &HashSet<String>) {
-        let now = Instant::now();
+    pub fn drain_reflected(&mut self, api_nr_names: &HashSet<String>, now: Timestamp) {
+        let ttl = SignedDuration::from_secs(UNCONFIRMED_CREATES_TTL.as_secs() as i64);
         let before = self.entries.len();
         self.entries.retain(|e| {
-            !api_nr_names.contains(&e.nr_name)
-                && now.duration_since(e.created_at) < RECENT_CREATES_TTL
+            !api_nr_names.contains(&e.nr_name) && now.duration_since(e.created_at) < ttl
         });
         let drained = before - self.entries.len();
         if drained > 0 {
             debug!(
                 drained,
                 remaining = self.entries.len(),
-                "drained recent_creates"
+                "drained unconfirmed_creates"
             );
         }
     }
 
-    /// Get all cached in-flight capacities.
-    pub fn capacities(&self) -> Vec<InFlightCapacity> {
-        self.entries.iter().map(|e| e.capacity.clone()).collect()
+    /// Get all cached in-flight capacity entries.
+    fn entries(&self) -> impl Iterator<Item = &InFlightCapacity> {
+        self.entries.iter().map(|e| &e.capacity)
     }
 
     pub fn len(&self) -> usize {
@@ -83,6 +113,144 @@ impl RecentCreates {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Result of scanning NodeRequests for in-flight state.
+struct InFlightScan {
+    /// In-flight entries for solver pre-seeding.
+    in_flight: Vec<InFlightCapacity>,
+    /// Pending/Provisioning NR counts for occupied_counts.
+    nr_counts: HashMap<String, HashMap<String, u32>>,
+    /// Names of all NodeRequests seen, for draining UnconfirmedCreates.
+    api_nr_names: HashSet<String>,
+}
+
+/// Build an empty UnconfirmedCreates buffer.
+///
+/// On startup, the API list in the first reconcile loop will provide the
+/// full in-flight state. UnconfirmedCreates only bridges the gap between NR
+/// creation and the *next* API list, so it starts empty.
+pub fn init_unconfirmed_creates() -> UnconfirmedCreates {
+    UnconfirmedCreates::default()
+}
+
+/// One-shot reconcile: gather state, solve, and create any needed NodeRequests.
+#[instrument(skip_all, fields(reconcile_id = %uuid::Uuid::new_v4()))]
+#[allow(unused_variables, unused_assignments)]
+pub async fn reconcile_unschedulable_pods(
+    client: Client,
+    provider: &Provider,
+    unconfirmed_creates: &mut UnconfirmedCreates,
+    unmet_ttl: Duration,
+    now: k8s_openapi::jiff::Timestamp,
+) -> Result<(), ControllerError> {
+    let state = gather_cluster_state(&client, provider, unconfirmed_creates, unmet_ttl, now)
+        .await
+        .map_err(|e| ControllerError::Other(e.into()))?;
+    let result = reconcile_pod_demand(state);
+
+    for err in &result.pod_errors {
+        warn!(pod = %err.pod_id, reason = %err.reason, "pod could not be assigned to a pool");
+    }
+
+    for (nr_creates, demand) in result.demands.into_iter().enumerate() {
+        fail::fail_point!("reconcile_after_nr_create", |_| {
+            Err(ControllerError::FaultInjected(nr_creates))
+        });
+
+        let created = create_node_request(
+            client.clone(),
+            &demand.pool,
+            &demand.pool_uid,
+            NodeRequestSpec {
+                target_offering: demand.target_offering.instance_type.clone(),
+                location: demand.target_offering.location.region.clone(),
+                resources: demand.target_offering.resources.clone(),
+                node_id: format!("growth-{}", uuid::Uuid::new_v4()),
+            },
+        )
+        .await?;
+        let nr_name = created.metadata.name.unwrap_or_default();
+        unconfirmed_creates.record(
+            nr_name,
+            demand.pool,
+            demand.target_offering.instance_type.to_string(),
+            demand.target_offering.location.region.0.clone(),
+            demand
+                .target_offering
+                .location
+                .zone
+                .as_ref()
+                .map(|z| z.0.clone()),
+            demand.target_offering.resources,
+            now,
+        );
+    }
+    Ok(())
+}
+
+async fn gather_cluster_state(
+    client: &Client,
+    provider: &Provider,
+    unconfirmed_creates: &mut UnconfirmedCreates,
+    unmet_ttl: Duration,
+    now: k8s_openapi::jiff::Timestamp,
+) -> Result<ClusterState, ControllerError> {
+    let (unschedulable_pods, offerings, node_counts, pools) = tokio::try_join!(
+        get_unschedulable_pods(client.clone()),
+        async { Ok(provider.offerings().await) },
+        get_node_counts(client.clone()),
+        get_node_pools(client.clone()),
+    )?;
+    let scan = scan_node_requests(client.clone(), unmet_ttl, now, &offerings).await?;
+    unconfirmed_creates.drain_reflected(&scan.api_nr_names, now);
+
+    let demands: Vec<_> = unschedulable_pods
+        .iter()
+        .map(|p| {
+            crate::offering::PodResources::from_pod(p)
+                .map_err(|e| ControllerError::ConfigError(e.into()))
+        })
+        .collect::<std::result::Result<Vec<_>, ControllerError>>()?;
+
+    // Build in-flight nodes per pool from API scan + UnconfirmedCreates.
+    let in_flight_count = scan.in_flight.len() + unconfirmed_creates.len();
+    let mut in_flight_nodes: HashMap<String, Vec<ExistingNode>> = HashMap::new();
+    for entry in scan.in_flight.iter().chain(unconfirmed_creates.entries()) {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "topology.kubernetes.io/region".into(),
+            entry.location.clone(),
+        );
+        if let Some(ref zone) = entry.zone {
+            labels.insert("topology.kubernetes.io/zone".into(), zone.clone());
+        }
+        in_flight_nodes
+            .entry(entry.pool.clone())
+            .or_default()
+            .push(ExistingNode {
+                resources: entry.resources.clone(),
+                labels,
+            });
+    }
+
+    let occupied_counts = merge_occupied_counts(scan.nr_counts, node_counts);
+
+    debug!(
+        total_unschedulable = unschedulable_pods.len(),
+        in_flight_nrs = in_flight_count,
+        unconfirmed_creates = unconfirmed_creates.len(),
+        total_demands = demands.len(),
+        "cluster state gathered"
+    );
+
+    Ok(ClusterState {
+        demands,
+        offerings,
+        occupied_counts,
+        pools,
+        in_flight_nodes,
+    })
 }
 
 async fn get_unschedulable_pods(client: Client) -> Result<Vec<Pod>, ControllerError> {
@@ -120,23 +288,12 @@ async fn get_node_pools(client: Client) -> Result<Vec<PoolConfig>, ControllerErr
         .collect())
 }
 
-/// Result of scanning NodeRequests for in-flight state.
-struct InFlightScan {
-    /// Capacity to feed into subtract_in_flight.
-    in_flight: Vec<InFlightCapacity>,
-    /// Pending/Provisioning NR counts for occupied_counts.
-    nr_counts: HashMap<String, HashMap<String, u32>>,
-    /// Names of all NodeRequests seen, for draining RecentCreates.
-    api_nr_names: HashSet<String>,
-}
-
 async fn scan_node_requests(
     client: Client,
     unmet_ttl: Duration,
     now: k8s_openapi::jiff::Timestamp,
+    offerings: &[Offering],
 ) -> Result<InFlightScan, ControllerError> {
-    use crate::controller::node_requests::is_unmet_expired;
-
     let api: Api<NodeRequest> = Api::all(client);
     let lp = ListParams::default();
     let mut in_flight = Vec::new();
@@ -159,25 +316,28 @@ async fn scan_node_requests(
                     .find(|r| r.kind == "NodePool")
                     .map(|r| r.name.clone())
             })
-            .unwrap_or_default();
+            .ok_or(ControllerError::MissingName("NodeRequest"))?;
 
-        let capacity = InFlightCapacity {
+        let entry = InFlightCapacity {
             pool: pool_name.clone(),
+            instance_type: nr.spec.target_offering.0.clone(),
+            location: nr.spec.location.0.clone(),
+            zone: lookup_zone(offerings, &nr.spec.target_offering.0, &nr.spec.location.0),
             resources: nr.spec.resources.clone(),
         };
 
         match phase {
             NodeRequestPhase::Pending | NodeRequestPhase::Provisioning => {
-                in_flight.push(capacity);
+                in_flight.push(entry);
                 *nr_counts
                     .entry(pool_name)
                     .or_default()
-                    .entry(nr.spec.target_offering.clone())
+                    .entry(nr.spec.target_offering.0.clone())
                     .or_insert(0) += 1;
             }
             NodeRequestPhase::Unmet => {
                 if !is_unmet_expired(&nr, unmet_ttl, now) {
-                    in_flight.push(capacity);
+                    in_flight.push(entry);
                 }
             }
             NodeRequestPhase::Ready => {}
@@ -221,109 +381,6 @@ async fn get_node_counts(
     Ok(counts)
 }
 
-async fn gather_cluster_state(
-    client: &Client,
-    provider: &Provider,
-    recent_creates: &mut RecentCreates,
-    unmet_ttl: Duration,
-    now: k8s_openapi::jiff::Timestamp,
-) -> Result<ClusterState, ControllerError> {
-    let unschedulable_pods = get_unschedulable_pods(client.clone()).await?;
-    let offerings = provider.offerings().await;
-    let scan = scan_node_requests(client.clone(), unmet_ttl, now).await?;
-    let node_counts = get_node_counts(client.clone()).await?;
-    let pools = get_node_pools(client.clone()).await?;
-
-    recent_creates.drain_reflected(&scan.api_nr_names);
-
-    let all_demands: Vec<_> = unschedulable_pods
-        .iter()
-        .map(|p| {
-            crate::offering::PodResources::from_pod(p)
-                .map_err(|e| ControllerError::ConfigError(e.into()))
-        })
-        .collect::<std::result::Result<Vec<_>, ControllerError>>()?;
-
-    let mut in_flight = scan.in_flight;
-    in_flight.extend(recent_creates.capacities());
-
-    let demands = subtract_in_flight(all_demands, &in_flight);
-
-    let occupied_counts = merge_occupied_counts(scan.nr_counts, node_counts);
-
-    debug!(
-        total_unschedulable = unschedulable_pods.len(),
-        in_flight_nrs = in_flight.len(),
-        recent_creates = recent_creates.len(),
-        residual_demands = demands.len(),
-        "resource-based dedup complete"
-    );
-
-    Ok(ClusterState {
-        demands,
-        offerings,
-        occupied_counts,
-        pools,
-    })
-}
-
-/// Build an empty RecentCreates cache.
-///
-/// On startup, the API list in the first reconcile loop will provide the
-/// full in-flight state. RecentCreates only bridges the gap between NR
-/// creation and the *next* API list, so it starts empty.
-pub fn init_recent_creates() -> RecentCreates {
-    RecentCreates::default()
-}
-
-/// One-shot reconcile: gather state, solve, and create any needed NodeRequests.
-#[instrument(skip_all, fields(reconcile_id = %uuid::Uuid::new_v4()))]
-#[allow(unused_variables, unused_assignments)]
-pub async fn reconcile_unschedulable_pods(
-    client: Client,
-    provider: &Provider,
-    recent_creates: &mut RecentCreates,
-    unmet_ttl: Duration,
-    now: k8s_openapi::jiff::Timestamp,
-) -> Result<(), ControllerError> {
-    let state = gather_cluster_state(&client, provider, recent_creates, unmet_ttl, now)
-        .await
-        .map_err(|e| ControllerError::Other(e.into()))?;
-    let result = reconcile_pods(state)?;
-
-    for err in &result.pod_errors {
-        warn!(pod = %err.pod_id, reason = %err.reason, "pod could not be assigned to a pool");
-    }
-
-    for (nr_creates, demand) in result.demands.into_iter().enumerate() {
-        fail::fail_point!("reconcile_after_nr_create", |_| {
-            Err(ControllerError::FaultInjected(nr_creates))
-        });
-
-        let created = create_node_request(
-            client.clone(),
-            &demand.pool,
-            &demand.pool_uid,
-            NodeRequestSpec {
-                target_offering: demand.target_offering.instance_type.to_string(),
-                location: demand.target_offering.location.region.0.clone(),
-                resources: demand.target_offering.resources.clone(),
-                node_id: format!("growth-{}", uuid::Uuid::new_v4()),
-            },
-        )
-        .await?;
-        let nr_name = created.metadata.name.unwrap_or_default();
-        recent_creates.record(
-            nr_name,
-            InFlightCapacity {
-                pool: demand.pool,
-                resources: demand.target_offering.resources,
-            },
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -345,7 +402,7 @@ mod tests {
     use crate::providers::fake::FakeProvider;
     use crate::providers::provider::Provider;
 
-    use super::{RecentCreates, reconcile_unschedulable_pods};
+    use super::{UnconfirmedCreates, reconcile_unschedulable_pods};
 
     type ApiServerHandle = tower_test::mock::Handle<Request<Body>, Response<Body>>;
 
@@ -610,7 +667,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -632,7 +689,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -659,7 +716,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -690,7 +747,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -705,7 +762,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -715,8 +772,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_creates_prevent_duplicate_node_requests() {
-        // Two sequential calls share the same recent_creates. The mock API
+    async fn unconfirmed_creates_prevent_duplicate_node_requests() {
+        // Two sequential calls share the same unconfirmed_creates. The mock API
         // always returns an empty NodeRequest list (simulating API lag), so only the
         // in-memory cache prevents the second call from creating duplicates.
         let provider = Provider::Fake(
@@ -724,15 +781,15 @@ mod tests {
         );
         let pod = make_pending_unschedulable_pod("dup-pod", "1", "2048Mi");
 
-        let mut recent_creates = RecentCreates::default();
+        let mut unconfirmed_creates = UnconfirmedCreates::default();
 
-        // First call — should create 1 NodeRequest and populate recent_creates.
+        // First call — should create 1 NodeRequest and populate unconfirmed_creates.
         let (client1, handle1) = mock_client();
         let nr_count1 = spawn_mock_api(handle1, vec![pod.clone()], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut recent_creates,
+            &mut unconfirmed_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -744,18 +801,18 @@ mod tests {
             "first call should create 1 NodeRequest"
         );
         assert!(
-            !recent_creates.is_empty(),
-            "recent_creates should have capacity recorded after first call"
+            !unconfirmed_creates.is_empty(),
+            "unconfirmed_creates should have capacity recorded after first call"
         );
 
         // Second call — same pod still pending, empty NodeRequest list from API,
-        // but recent_creates capacity absorbed the pod demand via subtract_in_flight.
+        // but unconfirmed_creates capacity is passed to the solver as pre-seeded nodes.
         let (client2, handle2) = mock_client();
         let nr_count2 = spawn_mock_api(handle2, vec![pod], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut recent_creates,
+            &mut unconfirmed_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -764,26 +821,26 @@ mod tests {
         assert_eq!(
             nr_count2.load(Ordering::SeqCst),
             0,
-            "second call should create 0 NodeRequests — recent_creates prevents duplicates"
+            "second call should create 0 NodeRequests — unconfirmed_creates prevents duplicates"
         );
     }
 
     #[tokio::test]
-    async fn recent_creates_drained_when_api_catches_up() {
+    async fn unconfirmed_creates_drained_when_api_catches_up() {
         let provider = Provider::Fake(
             FakeProvider::new().with_offerings(vec![test_offering("cpx22", 2, 4096, 0.01)]),
         );
         let pod = make_pending_unschedulable_pod("drain-pod", "1", "2048Mi");
 
-        let mut recent_creates = RecentCreates::default();
+        let mut unconfirmed_creates = UnconfirmedCreates::default();
 
-        // First call — empty NodeRequest list, creates 1 NodeRequest, populates recent_creates.
+        // First call — empty NodeRequest list, creates 1 NodeRequest, populates unconfirmed_creates.
         let (client1, handle1) = mock_client();
         let nr_count1 = spawn_mock_api(handle1, vec![pod.clone()], vec!["cpx22"]);
         reconcile_unschedulable_pods(
             client1,
             &provider,
-            &mut recent_creates,
+            &mut unconfirmed_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -791,12 +848,12 @@ mod tests {
         .unwrap();
         assert_eq!(nr_count1.load(Ordering::SeqCst), 1);
         assert!(
-            !recent_creates.is_empty(),
-            "recent_creates should have an entry after first call"
+            !unconfirmed_creates.is_empty(),
+            "unconfirmed_creates should have an entry after first call"
         );
 
         // Second call — API now reflects the NodeRequest (Pending phase). The API-listed NR
-        // absorbs the demand via in-flight resource subtraction, and recent_creates is drained
+        // absorbs the demand via in-flight resource subtraction, and unconfirmed_creates is drained
         // because its name matches an API entry. No new NodeRequest created.
         let (client2, handle2) = mock_client();
         let nr_items = vec![make_nr_json("test-nr", "Pending")];
@@ -804,7 +861,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client2,
             &provider,
-            &mut recent_creates,
+            &mut unconfirmed_creates,
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -812,8 +869,8 @@ mod tests {
         .unwrap();
         assert_eq!(nr_count2.load(Ordering::SeqCst), 0);
         assert!(
-            recent_creates.is_empty(),
-            "recent_creates should be drained once the API reflects the NodeRequest"
+            unconfirmed_creates.is_empty(),
+            "unconfirmed_creates should be drained once the API reflects the NodeRequest"
         );
     }
 
@@ -824,7 +881,7 @@ mod tests {
         );
         let pod = make_pending_unschedulable_pod("retry-pod", "1", "2048Mi");
 
-        let mut recent_creates = RecentCreates::default();
+        let mut unconfirmed_creates = UnconfirmedCreates::default();
 
         // An Unmet NodeRequest exists in the API. With unmet_ttl=0 it is immediately
         // expired and does not contribute to in-flight capacity, so the pod re-enters demand.
@@ -834,7 +891,7 @@ mod tests {
         reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut recent_creates,
+            &mut unconfirmed_creates,
             Duration::from_secs(0),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -846,8 +903,8 @@ mod tests {
             "pod should re-enter demand and produce a new NodeRequest"
         );
         assert!(
-            !recent_creates.is_empty(),
-            "new NodeRequest should populate recent_creates"
+            !unconfirmed_creates.is_empty(),
+            "new NodeRequest should populate unconfirmed_creates"
         );
     }
 
@@ -912,7 +969,7 @@ mod tests {
         let result = reconcile_unschedulable_pods(
             client,
             &provider,
-            &mut RecentCreates::default(),
+            &mut UnconfirmedCreates::default(),
             Duration::from_secs(120),
             k8s_openapi::jiff::Timestamp::now(),
         )
@@ -923,5 +980,89 @@ mod tests {
             0,
             "nameless pool should be skipped — pod has no pool, so no NodeRequest is created"
         );
+    }
+
+    #[test]
+    fn unconfirmed_creates_ttl_expiry() {
+        use std::collections::HashSet;
+
+        use k8s_openapi::jiff::{SignedDuration, Timestamp};
+
+        use crate::offering::Resources;
+
+        let mut uc = UnconfirmedCreates::default();
+        let t0 = Timestamp::now();
+
+        uc.record(
+            "nr-old".into(),
+            "pool".into(),
+            "cpx22".into(),
+            "fsn1".into(),
+            None,
+            Resources {
+                cpu: 2,
+                memory_mib: 4096,
+                ephemeral_storage_gib: None,
+                gpu: 0,
+                gpu_model: None,
+            },
+            t0,
+        );
+        uc.record(
+            "nr-fresh".into(),
+            "pool".into(),
+            "cpx22".into(),
+            "fsn1".into(),
+            None,
+            Resources {
+                cpu: 2,
+                memory_mib: 4096,
+                ephemeral_storage_gib: None,
+                gpu: 0,
+                gpu_model: None,
+            },
+            t0,
+        );
+        assert_eq!(uc.len(), 2);
+
+        // 61s later — both entries exceed the 60s TTL and should be expired.
+        let t1 = t0.checked_add(SignedDuration::from_secs(61)).unwrap();
+        let empty_api: HashSet<String> = HashSet::new();
+        uc.drain_reflected(&empty_api, t1);
+        assert_eq!(uc.len(), 0, "entries older than TTL should be expired");
+    }
+
+    #[test]
+    fn unconfirmed_creates_within_ttl_retained() {
+        use std::collections::HashSet;
+
+        use k8s_openapi::jiff::{SignedDuration, Timestamp};
+
+        use crate::offering::Resources;
+
+        let mut uc = UnconfirmedCreates::default();
+        let t0 = Timestamp::now();
+
+        uc.record(
+            "nr-young".into(),
+            "pool".into(),
+            "cpx22".into(),
+            "fsn1".into(),
+            None,
+            Resources {
+                cpu: 2,
+                memory_mib: 4096,
+                ephemeral_storage_gib: None,
+                gpu: 0,
+                gpu_model: None,
+            },
+            t0,
+        );
+
+        // 30s later — well within the 60s TTL.
+        let t1 = t0.checked_add(SignedDuration::from_secs(30)).unwrap();
+        let empty_api: HashSet<String> = HashSet::new();
+        uc.drain_reflected(&empty_api, t1);
+        assert_eq!(uc.len(), 1, "entry within TTL should be retained");
     }
 }

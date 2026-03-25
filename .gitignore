@@ -2,3 +2,4 @@ growthrs/target/
 growthrs/.claude/
 growthrs/Cargo.lock
 .claude/settings.local.json
+.claude/**/*

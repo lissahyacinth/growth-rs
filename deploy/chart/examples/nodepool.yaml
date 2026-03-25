@@ -1,0 +1,18 @@
+# Example NodePool — declares which server types the autoscaler may provision.
+#
+# Pods opt into this pool via nodeSelector:
+#   growth.vettrdev.com/pool: default
+apiVersion: growth.vettrdev.com/v1alpha1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  serverTypes:
+    - name: cpx22       # 2 vCPU,  4 GB — lightweight workloads
+      max: 3
+  locations:
+    - region: nbg1
+  labels:
+    growth.vettrdev.com/pool: default
+  nodeClassRef:
+    name: k3s-agent     # Must match the HetznerNodeClass name

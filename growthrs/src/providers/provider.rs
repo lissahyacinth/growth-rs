@@ -34,6 +34,7 @@ pub enum ProviderCreateConfig {
 /// Configuration needed to construct a `Provider`.
 pub struct ProviderConfig {
     pub kube_client: kube::Client,
+    /// Hetzner Cloud API Token
     pub hcloud_token: Option<String>,
 }
 
@@ -77,14 +78,16 @@ pub enum ProviderError {
 /// that's exclusively the Node Watcher's domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStatus {
-    /// VM is still being built/booted.
+    /// VM is still being built/starting up.
     Creating,
     /// VM is running (says nothing about K8s).
     Running,
-    /// VM definitively failed.
-    Failed { reason: String },
-    /// Provider has no record of this VM.
+    /// VM is being Deleted or Stopped.
+    Removing,
+    /// Provider cannot find the VM - i.e. it has been deleted.
     NotFound,
+    /// VM failed for a Provider Specific Reason.
+    Failed { reason: String },
 }
 
 /// Provide Nodes from a given Provider - i.e. Hetzner, KWOK
@@ -116,7 +119,7 @@ impl ProviderName {
 }
 
 impl Provider {
-    /// Build a provider by name.  Errors if the name is unrecognised.
+    /// Build a provider by name. Errors if the name is unrecognised.
     pub fn from_name(name: &str, config: ProviderConfig) -> Result<Self, ProviderError> {
         match name {
             "kwok" => Ok(Self::Kwok(KwokProvider::new(config.kube_client))),
@@ -130,6 +133,7 @@ impl Provider {
         }
     }
 
+    // TODO: This should be cached.
     pub async fn offerings(&self) -> Vec<Offering> {
         match self {
             Self::Kwok(p) => p.offerings().await,

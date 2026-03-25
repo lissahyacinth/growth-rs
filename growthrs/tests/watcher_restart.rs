@@ -21,29 +21,17 @@ use std::time::Duration;
 
 use growthrs::config::ControllerContext;
 use growthrs::controller::run_pod_watcher;
-use growthrs::crds::node_request::NodeRequest;
 use growthrs::providers::kwok::KwokProvider;
 use growthrs::providers::provider::Provider;
+use growthrs::resources::node_request::NodeRequest;
 use growthrs::testing;
 
 /// 60 pods at 1 cpu each → 30 cpx22 nodes (2 cpu each).
 const EXPECTED_NRS: usize = 30;
 const POD_COUNT: u32 = 60;
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
-}
-
 fn make_ctx(client: kube::Client) -> Arc<ControllerContext> {
-    Arc::new(ControllerContext {
-        client: client.clone(),
-        provider: Provider::Kwok(KwokProvider::new(client)),
-        provisioning_timeout: Duration::from_secs(300),
-        scale_down: growthrs::config::ScaleDownConfig::default(),
-        clock: Box::new(growthrs::clock::SystemClock),
-    })
+    testing::make_test_ctx(client.clone(), Provider::Kwok(KwokProvider::new(client)))
 }
 
 /// Clean slate: nuke, create pool + pods, wait for all pods Unschedulable.
@@ -53,7 +41,7 @@ async fn setup_round(client: kube::Client, round: usize) {
     testing::create_node_pool(
         client.clone(),
         "default",
-        vec![growthrs::crds::node_pool::ServerTypeConfig {
+        vec![growthrs::resources::node_pool::ServerTypeConfig {
             name: "cpx22".to_string(),
             max: EXPECTED_NRS as u32,
             min: 0,
@@ -190,9 +178,10 @@ async fn run_recovery_watcher(client: kube::Client) -> Vec<NodeRequest> {
 
 /// Crash the reconciler at early/mid/late points and verify the recovery
 /// watcher produces exactly EXPECTED_NRS with no duplicate pod UIDs.
+#[cfg_attr(feature = "toxi", ignore = "too slow under network latency injection")]
 #[tokio::test]
-async fn watcher_recovers_after_mid_reconcile_crash() {
-    init_tracing();
+async fn e2e_watcher_recovers_after_mid_reconcile_crash() {
+    testing::init_tracing();
     let _scenario = fail::FailScenario::setup();
     let client = growthrs::testing::test_client().await;
 

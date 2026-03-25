@@ -1,0 +1,12 @@
+apiVersion: growth.vettrdev.com/v1alpha1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  serverTypes:
+    - name: cpx22       # 2 vCPU,  4 GB — lightweight workloads
+      max: 3
+  locations:
+    - region: nbg1
+  labels:
+    growth.vettrdev.com/pool: default

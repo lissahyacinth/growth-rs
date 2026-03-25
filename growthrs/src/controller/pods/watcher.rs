@@ -11,11 +11,6 @@ use tracing::{info, warn};
 use crate::controller::pods;
 use crate::controller::{ControllerContext, ControllerError};
 
-enum TriggerType {
-    Batch,
-    MaxWindow,
-}
-
 const TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_WINDOW: Duration = Duration::from_secs(10);
 
@@ -35,9 +30,9 @@ pub async fn run_pod_watcher(ctx: Arc<ControllerContext>) -> Result<(), Controll
     let mut max_delay = ::std::pin::pin!(sleep(Duration::from_millis(0))); // Immediately expire this.
 
     let mut pending = false;
-    let mut trigger: Option<TriggerType> = None;
+    let mut trigger: bool = false;
 
-    let mut recent_creates = pods::init_recent_creates();
+    let mut unconfirmed_creates = pods::init_unconfirmed_creates();
 
     loop {
         tokio::select! {
@@ -61,20 +56,20 @@ pub async fn run_pod_watcher(ctx: Arc<ControllerContext>) -> Result<(), Controll
             _ = &mut delay, if pending => {
                 pending = false;
                 info!(trigger = "batch_timeout", "starting pod reconciliation");
-                trigger = Some(TriggerType::Batch);
+                trigger = true;
             }
             _ = &mut max_delay, if pending => {
                 pending = false;
                 info!(trigger = "max_window", "starting pod reconciliation");
-                trigger = Some(TriggerType::MaxWindow);
+                trigger = true;
                 delay.as_mut().reset(Instant::now() + TIMEOUT);
             }
         }
-        if trigger.is_some() {
+        if trigger {
             match pods::reconcile_unschedulable_pods(
                 ctx.client.clone(),
                 &ctx.provider,
-                &mut recent_creates,
+                &mut unconfirmed_creates,
                 ctx.scale_down.unmet_ttl,
                 ctx.clock.now(),
             )
@@ -90,6 +85,8 @@ pub async fn run_pod_watcher(ctx: Arc<ControllerContext>) -> Result<(), Controll
                     sleep(Duration::from_secs(5)).await;
                 }
             }
+            // Reset trigger after successful reconciliation
+            trigger = false;
         }
     }
     Ok(())
